@@ -97,17 +97,11 @@ pub enum UserEvent {
     ServerReady,
     /// Fatal error — show it in the window.
     Fatal(String),
-    /// A paste (Cmd/Ctrl+V) was requested from the in-app input box. The main
-    /// thread reads the system clipboard (via `arboard`, which works even on a
-    /// non-secure local page where `navigator.clipboard` is blocked) and injects
-    /// the text back into the webview input box.
-    PasteRequest,
 }
 
 fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
-    let ipc_proxy = proxy.clone();
 
     let window = WindowBuilder::new()
         .with_title("DeepSeek dsh Web")
@@ -116,6 +110,13 @@ fn main() {
         .expect("无法创建窗口");
 
     window.set_window_icon(ui::load_window_icon());
+
+    // macOS: without a native Edit menu, AppKit never routes ⌘V (and friends)
+    // into the webview, so pasting into the in-app input box would silently
+    // fail. Build a minimal Edit menu whose key equivalents ⌘X/⌘C/⌘V/⌘A are
+    // picked up by AppKit and forwarded as `paste:` etc. to the focused field.
+    #[cfg(target_os = "macos")]
+    setup_macos_app_menu();
 
     // Shared state for the running command + in-app terminal.
     let handle: Arc<Mutex<Option<ServerHandle>>> = Arc::new(Mutex::new(None));
@@ -130,15 +131,10 @@ fn main() {
     .with_ipc_handler({
         let input_writer = input_writer.clone();
         let user_took_over = user_took_over.clone();
-        let ipc_p = ipc_proxy.clone();
         move |request| {
             // macOS delivers the posted string in request.body(); be defensive.
             let s = request.body().to_string();
-            if s == "PASTE" {
-                // Forward to the main thread: it reads the system clipboard and
-                // injects the text into #cmd (see UserEvent::PasteRequest).
-                let _ = ipc_p.send_event(UserEvent::PasteRequest);
-            } else if let Some(d) = s.strip_prefix("IN:") {
+            if let Some(d) = s.strip_prefix("IN:") {
                     user_took_over.store(true, Ordering::SeqCst);
                     if let Some(w) = input_writer.lock().unwrap().as_mut() {
                         let _ = w.write_all(d.as_bytes());
@@ -206,22 +202,6 @@ fn main() {
                     // wiping the whole page — the user needs to see what happened.
                     let _ = webview.evaluate_script(&format!("showFatal({})", ui::js_string_arg(&msg)));
                 }
-                UserEvent::PasteRequest => {
-                    // Read the system clipboard and inject it into the in-app
-                    // input box. `arboard` talks to the OS clipboard directly, so
-                    // this works even though the page is a non-secure local URL
-                    // where `navigator.clipboard` is unavailable (macOS WKWebView).
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        if let Ok(text) = cb.get_text() {
-                            if !text.is_empty() {
-                                let _ = webview.evaluate_script(&format!(
-                                    "insertText({})",
-                                    ui::js_string_arg(&text)
-                                ));
-                            }
-                        }
-                    }
-                }
             },
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
@@ -237,4 +217,59 @@ fn main() {
             _ => {}
         }
     });
+}
+
+/// Build a minimal macOS application Edit menu (Undo, Redo, Cut, Copy, Paste,
+/// Select All) so that the standard ⌘-shortcuts are delivered to the webview's
+/// focused input. This is what makes ⌘V work inside WKWebView — without it the
+/// key equivalent is never claimed by AppKit and the paste never reaches the
+/// `<input>`. The items target the first responder (nil target), so WKWebView's
+/// own `paste:`/`copy:`/… implementations handle them natively.
+#[cfg(target_os = "macos")]
+fn setup_macos_app_menu() {
+    use objc2::MainThreadMarker;
+    use objc2::runtime::Sel;
+    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+    use objc2_foundation::NSString;
+
+    let mtm = match MainThreadMarker::new() {
+        Some(m) => m,
+        None => return, // not on the main thread; menu would be unsafe
+    };
+
+    let app = NSApplication::sharedApplication(mtm);
+
+    let main_menu = NSMenu::new(mtm);
+    main_menu.setTitle(&NSString::from_str("MainMenu"));
+
+    let edit_menu = NSMenu::new(mtm);
+    edit_menu.setTitle(&NSString::from_str("Edit"));
+
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setTitle(&NSString::from_str("Edit"));
+    edit_item.setSubmenu(Some(&edit_menu));
+
+    // Append one standard edit command. `action` targets the first responder,
+    // so the webview fills in the actual behavior.
+    let add = |menu: &NSMenu, title: &str, action: Option<Sel>, key: &str| {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(title));
+        // setAction is `unsafe` (the selector must be valid). The closure does
+        // not inherit the outer `unsafe fn` context, so wrap it explicitly.
+        unsafe { item.setAction(action); }
+        item.setKeyEquivalent(&NSString::from_str(key));
+        menu.addItem(&item);
+    };
+
+    add(&edit_menu, "Undo", Some(objc2::sel!(undo:)), "z");
+    add(&edit_menu, "Redo", Some(objc2::sel!(redo:)), "Z");
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add(&edit_menu, "Cut", Some(objc2::sel!(cut:)), "x");
+    add(&edit_menu, "Copy", Some(objc2::sel!(copy:)), "c");
+    add(&edit_menu, "Paste", Some(objc2::sel!(paste:)), "v");
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add(&edit_menu, "Select All", Some(objc2::sel!(selectAll:)), "a");
+
+    main_menu.addItem(&edit_item);
+    app.setMainMenu(Some(&main_menu));
 }

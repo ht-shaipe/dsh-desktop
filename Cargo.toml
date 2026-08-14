@@ -8,7 +8,14 @@ tao = "0.30"
 wry = "0.49"
 libc = "0.2"
 png = "0.17"
-arboard = "3"
+
+# On macOS we build a tiny native Edit menu (Cut/Copy/Paste/Select All/Undo/
+# Redo) so that ⌘V (and friends) are routed by AppKit into the webview's input
+# field. Without it, WKWebView never receives the system paste shortcut.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
 
 [profile.release]
 lto = true
