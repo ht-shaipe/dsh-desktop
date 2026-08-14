@@ -10,6 +10,12 @@
 #   - Windows x86_64: dsh-desktop-windows-x86_64.zip
 #   - checksums.txt（SHA-256）
 #
+# 命名约定：
+#   - 应用名（包内）一律不加平台区分：macOS 内为 dsh-desktop.app，
+#     Linux 内为 dsh-desktop 可执行文件，Windows 内为 dsh-desktop.exe。
+#   - 压缩包（对外分发）加平台区分：.dmg / .tar.gz / .zip 文件名含
+#     macos-aarch64 / macos-x86_64 / linux-x86_64 / windows-x86_64。
+#
 # 注意（非阻塞，可后续增强）：本工作流产出的是「未签名」构建。
 #   - macOS 未签名 .dmg/.app 在用户机器上会被 Gatekeeper 拦截，需右键「打开」或 `xattr -cr` 放行；
 #     若要彻底解决，需配置 Apple Developer ID 证书 + notarytool（见文件末尾注释示例）。
@@ -55,15 +61,16 @@ jobs:
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
 
-      - name: Package (two arch-specific .dmg)
+      # 应用包名保持 dsh-desktop.app（不加平台区分）；仅 .dmg 压缩包加平台区分。
+      # 两次打包依次进行，每次 build 后立即出 dmg，避免第二次 rm -rf dsh-desktop.app
+      # 覆盖第一次的产物（dmg 已先行生成，不受影响）。
+      - name: Package (two arch-specific .dmg; app name stays plain)
         run: |
           DSH_BIN=target/aarch64-apple-darwin/release/dsh-desktop bash package-macos.sh
-          mv dsh-desktop.app dsh-desktop-macos-aarch64.app
-          hdiutil create -srcfolder dsh-desktop-macos-aarch64.app -format UDZO -ov -o dsh-desktop-macos-aarch64.dmg
+          hdiutil create -srcfolder dsh-desktop.app -format UDZO -ov -o dsh-desktop-macos-aarch64.dmg
 
           DSH_BIN=target/x86_64-apple-darwin/release/dsh-desktop bash package-macos.sh
-          mv dsh-desktop.app dsh-desktop-macos-x86_64.app
-          hdiutil create -srcfolder dsh-desktop-macos-x86_64.app -format UDZO -ov -o dsh-desktop-macos-x86_64.dmg
+          hdiutil create -srcfolder dsh-desktop.app -format UDZO -ov -o dsh-desktop-macos-x86_64.dmg
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
