@@ -56,7 +56,7 @@ pub struct ServerHandle {
     pub(crate) child: std::process::Child,
 }
 impl ServerHandle {
-    fn kill(&self) {
+    fn kill(&mut self) {
         #[cfg(unix)]
         unsafe {
             libc::killpg(self.pid as i32, libc::SIGKILL);
@@ -203,7 +203,7 @@ fn main() {
                 _ => {}
             },
             Event::LoopDestroyed => {
-                if let Some(h) = handle.lock().unwrap().take() {
+                if let Some(mut h) = handle.lock().unwrap().take() {
                     h.kill();
                 }
             }
