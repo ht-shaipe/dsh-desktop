@@ -1,14 +1,12 @@
 # Rust
 /target/
 **/*.rs.bk
-# 注：本仓库 .gitignore 含 `*.lock`，会一并忽略 Cargo.lock（二进制程序通常建议提交以保证可复现构建，如需要请按需调整）
+# 二进制程序建议提交 Cargo.lock 以保证 CI 可复现构建（不再用 *.lock  blanket 忽略）
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
-
-*.lock
 
 # Generated icon / app bundle (regenerate via package-macos.sh)
 *.app/

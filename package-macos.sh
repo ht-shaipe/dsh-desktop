@@ -9,11 +9,16 @@ IDENTIFIER="com.dsh.desktop"
 VERSION="0.1.0"
 ICON_PNG="icon/logo-480.png"
 ICNS="icon/AppIcon.icns"
-BIN="target/release/$APP_NAME"
 OUT="$APP_NAME.app"
 
-# 1. Build the optimized binary.
-cargo build --release
+# 1. Build the optimized binary. Honour DSH_BIN (set by CI for cross-arch
+# builds) to skip the build step and bundle a prebuilt binary instead.
+if [ -n "${DSH_BIN:-}" ] && [ -f "${DSH_BIN}" ]; then
+  BIN="${DSH_BIN}"
+else
+  cargo build --release
+  BIN="target/release/$APP_NAME"
+fi
 
 # 2. Generate an .icns from the PNG (only if missing).
 if [ ! -f "$ICNS" ]; then

@@ -1,0 +1,224 @@
+# 跨平台自动发版工作流
+#
+# 触发：仅在 GitHub 仓库的 Actions 页面手动运行（workflow_dispatch）。
+#   运行时会要求填写版本号（如 v0.2.0），该值即 Release 的 tag / 名称。
+#
+# 产物（均上传到同一个 GitHub Release）：
+#   - macOS  arm64 : dsh-desktop-macos-aarch64.dmg
+#   - macOS  x86_64: dsh-desktop-macos-x86_64.dmg   （Intel Mac）
+#   - Linux  x86_64: dsh-desktop-linux-x86_64.tar.gz
+#   - Windows x86_64: dsh-desktop-windows-x86_64.zip
+#   - checksums.txt（SHA-256）
+#
+# 注意（非阻塞，可后续增强）：本工作流产出的是「未签名」构建。
+#   - macOS 未签名 .dmg/.app 在用户机器上会被 Gatekeeper 拦截，需右键「打开」或 `xattr -cr` 放行；
+#     若要彻底解决，需配置 Apple Developer ID 证书 + notarytool（见文件末尾注释示例）。
+#   - Windows 未签名 .exe 会触发 SmartScreen 警告，用户选择「仍要运行」即可。
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release 版本号 / tag，例如 v0.2.0"
+        required: true
+        default: "v0.1.0"
+
+# 允许工作流创建 Release 与 tag
+permissions:
+  contents: write
+
+# 同一版本号只跑一个实例，避免重复发版
+concurrency:
+  group: release-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------------------------------
+  # macOS：在 Apple Silicon runner 上交叉编译 arm64 + x86_64，分别打包成两个 .dmg
+  # --------------------------------------------------------------------------
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (with both macOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (arm64 + x86_64)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Package (two arch-specific .dmg)
+        run: |
+          DSH_BIN=target/aarch64-apple-darwin/release/dsh-desktop bash package-macos.sh
+          mv dsh-desktop.app dsh-desktop-macos-aarch64.app
+          hdiutil create -srcfolder dsh-desktop-macos-aarch64.app -format UDZO -ov -o dsh-desktop-macos-aarch64.dmg
+
+          DSH_BIN=target/x86_64-apple-darwin/release/dsh-desktop bash package-macos.sh
+          mv dsh-desktop.app dsh-desktop-macos-x86_64.app
+          hdiutil create -srcfolder dsh-desktop-macos-x86_64.app -format UDZO -ov -o dsh-desktop-macos-x86_64.dmg
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dsh-desktop-macos-aarch64.dmg
+            dsh-desktop-macos-x86_64.dmg
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Linux：x86_64，需系统 webkit2gtk-4.1（wry 0.49 默认依赖）
+  # --------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (webkit2gtk-4.1 / GTK3)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            build-essential curl wget libssl-dev librsvg2-dev
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package (.tar.gz with binary + .desktop + icon)
+        run: |
+          mkdir -p dist
+          cp target/release/dsh-desktop dist/
+          cp resources/dsh-desktop.desktop dist/
+          cp icon/logo-480.png dist/ 2>/dev/null || true
+          tar -czvf dsh-desktop-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dsh-desktop-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Windows：x86_64，需 WebView2 运行时（Win11 自带；Win10 可能需安装）
+  # --------------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package (.zip with .exe)
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/dsh-desktop.exe -DestinationPath dsh-desktop-windows-x86_64.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dsh-desktop-windows-x86_64.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # 汇总：把三个平台的制品收集起来，生成校验和，创建 GitHub Release
+  # --------------------------------------------------------------------------
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release files + checksums
+        run: |
+          mkdir -p out
+          cp artifacts/macos/* out/
+          cp artifacts/linux/* out/
+          cp artifacts/windows/* out/
+          cd out
+          sha256sum * > checksums.txt
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.version }}
+          files: out/*
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            ## dsh-desktop ${{ github.event.inputs.version }}
+
+            跨平台构建（未签名）。
+
+            ### 下载与平台要求
+            - **macOS (Apple Silicon)** — `dsh-desktop-macos-aarch64.dmg`
+            - **macOS (Intel)** — `dsh-desktop-macos-x86_64.dmg`
+              > 未签名构建可能被 Gatekeeper 拦截：首次打开请右键「打开」，或在终端执行 `xattr -cr /Applications/dsh-desktop.app` 后重试。
+            - **Linux (x86_64)** — `dsh-desktop-linux-x86_64.tar.gz`
+              > 解压后运行 `./dsh-desktop`。需系统已安装 `libwebkit2gtk-4.1`（及 GTK3），例如：
+              > `sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev`
+            - **Windows (x86_64)** — `dsh-desktop-windows-x86_64.zip`
+              > 解压后运行 `dsh-desktop.exe`，需系统具备 WebView2 运行时（Windows 11 自带；Win10 可到微软官网安装）。
+
+            ### 校验
+            见 `checksums.txt`（SHA-256）。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ============================================================================
+# 可选增强：macOS 签名 + 公证（需要仓库 Secrets）
+#   1) 在仓库 Settings → Secrets 添加：
+#        MACOS_CERT_P12      : Developer ID Application 证书（导出为 .p12 的 base64）
+#        MACOS_CERT_PASSWORD : 该 p12 的密码
+#        APPLE_ID            : 苹果账号邮箱
+#        APPLE_PASSWORD      : App Store Connect 专用密码
+#        APPLE_TEAM_ID       : 团队 ID
+#   2) 在 macos job 的 Package 步骤前插入（示意）：
+#        - name: Import cert & sign & notarize
+#          env:
+#            CERT: ${{ secrets.MACOS_CERT_P12 }}
+#            CERT_PWD: ${{ secrets.MACOS_CERT_PASSWORD }}
+#          run: |
+#            echo "$CERT" | base64 -d > cert.p12
+#            security create-keychain -p "" build.keychain
+#            security import cert.p12 -k build.keychain -P "$CERT_PWD" -T /usr/bin/codesign
+#            security find-identity -v -p codesigning build.keychain
+#            codesign --force --options runtime --timestamp \
+#              --sign "Developer ID Application" dsh-desktop.app
+#            # 再用 notarytool 提交公证并 stapling
+#   Windows 同理可用 Authenticode 证书签名（需额外 Secrets 与 signtool 步骤）。
+# ============================================================================

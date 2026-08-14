@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=DeepSeek dsh Web
+Comment=在本地启动 DeepSeek dsh Web 服务并打开窗口
+Exec=dsh-desktop
+Icon=logo-480
+Terminal=false
+Type=Application
+Categories=Network;Utility;
