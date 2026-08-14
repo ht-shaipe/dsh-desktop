@@ -111,13 +111,6 @@ fn main() {
 
     window.set_window_icon(ui::load_window_icon());
 
-    // macOS: without a native Edit menu, AppKit never routes ⌘V (and friends)
-    // into the webview, so pasting into the in-app input box would silently
-    // fail. Build a minimal Edit menu whose key equivalents ⌘X/⌘C/⌘V/⌘A are
-    // picked up by AppKit and forwarded as `paste:` etc. to the focused field.
-    #[cfg(target_os = "macos")]
-    setup_macos_app_menu();
-
     // Shared state for the running command + in-app terminal.
     let handle: Arc<Mutex<Option<ServerHandle>>> = Arc::new(Mutex::new(None));
     let input_writer: InputSink = Arc::new(Mutex::new(None));
@@ -157,6 +150,19 @@ fn main() {
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
+
+        // macOS: install a minimal Edit menu on the first event loop turn so
+        // the ⌘X/⌘C/⌘V/⌘A shortcuts are routed into the webview's input. We do
+        // it here (not before `run`) because tao finalizes its app state during
+        // startup and could otherwise reset the main menu.
+        #[cfg(target_os = "macos")]
+        {
+            static MENU_INSTALLED: AtomicBool = AtomicBool::new(false);
+            if !MENU_INSTALLED.swap(true, Ordering::SeqCst) {
+                setup_macos_app_menu();
+            }
+        }
+
         match event {
             Event::UserEvent(ev) => match ev {
                 UserEvent::Checklist(html) => {
