@@ -8,6 +8,7 @@ tao = "0.30"
 wry = "0.49"
 libc = "0.2"
 png = "0.17"
+arboard = "3"
 
 [profile.release]
 lto = true

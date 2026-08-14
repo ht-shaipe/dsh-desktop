@@ -97,11 +97,17 @@ pub enum UserEvent {
     ServerReady,
     /// Fatal error — show it in the window.
     Fatal(String),
+    /// A paste (Cmd/Ctrl+V) was requested from the in-app input box. The main
+    /// thread reads the system clipboard (via `arboard`, which works even on a
+    /// non-secure local page where `navigator.clipboard` is blocked) and injects
+    /// the text back into the webview input box.
+    PasteRequest,
 }
 
 fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let ipc_proxy = proxy.clone();
 
     let window = WindowBuilder::new()
         .with_title("DeepSeek dsh Web")
@@ -121,13 +127,18 @@ fn main() {
     // where the user can watch progress and interact with the install.
     let webview = WebViewBuilder::new()
         .with_html(ui::loading_html())
-        .with_ipc_handler({
-            let input_writer = input_writer.clone();
-            let user_took_over = user_took_over.clone();
-            move |request| {
-                // macOS delivers the posted string in request.body(); be defensive.
-                let s = request.body().to_string();
-                if let Some(d) = s.strip_prefix("IN:") {
+    .with_ipc_handler({
+        let input_writer = input_writer.clone();
+        let user_took_over = user_took_over.clone();
+        let ipc_p = ipc_proxy.clone();
+        move |request| {
+            // macOS delivers the posted string in request.body(); be defensive.
+            let s = request.body().to_string();
+            if s == "PASTE" {
+                // Forward to the main thread: it reads the system clipboard and
+                // injects the text into #cmd (see UserEvent::PasteRequest).
+                let _ = ipc_p.send_event(UserEvent::PasteRequest);
+            } else if let Some(d) = s.strip_prefix("IN:") {
                     user_took_over.store(true, Ordering::SeqCst);
                     if let Some(w) = input_writer.lock().unwrap().as_mut() {
                         let _ = w.write_all(d.as_bytes());
@@ -194,6 +205,22 @@ fn main() {
                     // red error banner (with the last lines of output) instead of
                     // wiping the whole page — the user needs to see what happened.
                     let _ = webview.evaluate_script(&format!("showFatal({})", ui::js_string_arg(&msg)));
+                }
+                UserEvent::PasteRequest => {
+                    // Read the system clipboard and inject it into the in-app
+                    // input box. `arboard` talks to the OS clipboard directly, so
+                    // this works even though the page is a non-secure local URL
+                    // where `navigator.clipboard` is unavailable (macOS WKWebView).
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        if let Ok(text) = cb.get_text() {
+                            if !text.is_empty() {
+                                let _ = webview.evaluate_script(&format!(
+                                    "insertText({})",
+                                    ui::js_string_arg(&text)
+                                ));
+                            }
+                        }
+                    }
                 }
             },
             Event::WindowEvent { event, .. } => match event {

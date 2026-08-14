@@ -298,6 +298,21 @@
     return d.textContent || d.innerText || '';
   }
 
+  // Insert `text` at the caret of an <input>, preserving the selection
+  // (so pasting replaces any highlighted range, like a real field).
+  function insertAtCursor(input, text) {
+    var s = input.selectionStart != null ? input.selectionStart : input.value.length;
+    var e = input.selectionEnd != null ? input.selectionEnd : input.value.length;
+    input.value = input.value.slice(0, s) + text + input.value.slice(e);
+    var pos = s + text.length;
+    input.setSelectionRange(pos, pos);
+  }
+  // Called from Rust after it reads the system clipboard (paste via Cmd/Ctrl+V).
+  function insertText(t) {
+    var c = document.getElementById('cmd');
+    if (c) insertAtCursor(c, t != null ? t : '');
+  }
+
   var terminalShown = false;
   function showTerminal() {
     if (terminalShown) return;          // idempotent: never double-bind / double-header
@@ -311,40 +326,19 @@
     termLog('=== 启动 DeepSeek dsh Web ===');
     termLog('环境自检与启动状态将实时显示如下；命令运行输出也会在此呈现。');
     var c = document.getElementById('cmd');
-    // Insert `text` at the current caret position of an <input>, preserving the
-    // selection (so pasting replaces any highlighted range, like a real field).
-    function insertAtCursor(input, text) {
-      var s = input.selectionStart != null ? input.selectionStart : input.value.length;
-      var e = input.selectionEnd != null ? input.selectionEnd : input.value.length;
-      input.value = input.value.slice(0, s) + text + input.value.slice(e);
-      var pos = s + text.length;
-      input.setSelectionRange(pos, pos);
-    }
+    // Cmd/Ctrl+V: WKWebView (macOS) never routes it to a native `paste` event,
+    // and `navigator.clipboard` is blocked on the non-secure local page — so we
+    // forward the request to Rust, which reads the system clipboard (arboard)
+    // and injects the text back via `insertText()`.
     c.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
         var v = c.value; c.value = '';
         appendTerm('\r\ndsh> ' + v + '\r\n');
         window.ipc.postMessage('IN:' + v);
-      } else if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) {
-        // In some webviews (notably macOS WKWebView) Cmd/Ctrl+V is not
-        // translated into a native `paste` event, so we read the clipboard
-        // ourselves to make pasting always work.
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V' || e.code === 'KeyV')) {
         e.preventDefault();
-        if (navigator.clipboard && navigator.clipboard.readText) {
-          navigator.clipboard.readText().then(function (text) {
-            if (text) insertAtCursor(c, text);
-          }).catch(function () {});
-        }
+        window.ipc.postMessage('PASTE');
       }
-    });
-    c.addEventListener('paste', function (e) {
-      // Primary path: when the browser *does* fire a real paste event
-      // (WebView2 / webkit2gtk / right-click menu), handle it synchronously —
-      // more reliable than the async clipboard API used above.
-      e.preventDefault();
-      var text = '';
-      try { text = (e.clipboardData || window.clipboardData).getData('text'); } catch (_) {}
-      if (text) insertAtCursor(c, text);
     });
     c.focus();
   }
