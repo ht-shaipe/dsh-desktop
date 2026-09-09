@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +21,25 @@ use std::process::{Child, Stdio};
 
 use tao::event_loop::EventLoopProxy;
 
-use crate::{ARGS, POLL_ADDR, InputSink, ServerHandle, UserEvent};
+use crate::{POLL_ADDR, TARGET_URL, InputSink, ServerHandle, UserEvent};
+use crate::environment::LaunchSpec;
+
+/// Append-only debug log used to diagnose startup/auth issues; safe to call
+/// from any thread, never panics. Located in /tmp so users can share it.
+pub fn dbg_log(msg: &str) {
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dsh-desktop-debug.log")
+    {
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
 
 /// Wraps a raw file descriptor so we can write user keystrokes into the PTY.
 #[cfg(unix)]
@@ -42,21 +59,30 @@ impl Write for FdWriter {
     }
 }
 
-/// Launch `npx -y @deepseek-ai/dsh web` inside the in-app interactive
+/// Launch the resolved dsh web command (bundled `node …/bin.js web` or the
+/// `npx -y @deepseek-ai/dsh web` fallback) inside the in-app interactive
 /// terminal, stream its output back to the UI, and wait for `127.0.0.1:3080`.
 pub fn launch_terminal(
-    npx: PathBuf,
+    spec: LaunchSpec,
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
     user_took_over: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
 ) {
-    let cmd = format!("{} {}", npx.display(), ARGS.join(" "));
+    let cmd = spec.display();
+    dbg_log(&format!("LAUNCH: {}", cmd));
     // Activity timestamp shared with the reader + server poller. Used to show a
     // "still working" heartbeat while npm downloads dependencies silently
     // (CI + non-TTY mode suppresses its progress output).
     let last_term = Arc::new(Mutex::new(Instant::now()));
+    // The authenticated URL printed by `dsh web` (e.g.
+    // `dsh web: http://127.0.0.1:3080?token=…`). Parsed from the child's
+    // stdout by the reader thread and consumed by `wait_for_server` so the
+    // webview navigates to the token-bearing URL instead of the bare port
+    // (which would render a blank page — the server rejects unauthenticated
+    // requests).
+    let server_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // The environment flow already switched the view to the interactive terminal
     // and logged the "准备启动" phase, so here we just make sure the view is up
@@ -74,23 +100,25 @@ pub fn launch_terminal(
 
     #[cfg(unix)]
     let started = start_command_pty(
-        &npx,
+        &spec,
         proxy.clone(),
         handle.clone(),
         input_writer.clone(),
         user_took_over.clone(),
         exited.clone(),
         last_term.clone(),
+        server_url.clone(),
     );
     #[cfg(windows)]
     let started = start_command_piped(
-        &npx,
+        &spec,
         proxy.clone(),
         handle.clone(),
         input_writer.clone(),
         user_took_over.clone(),
         exited.clone(),
         last_term.clone(),
+        server_url.clone(),
     );
 
     match started {
@@ -99,7 +127,7 @@ pub fn launch_terminal(
             // Echo the command being run so the terminal reads like a real shell.
             *last_term.lock().unwrap() = Instant::now();
             let _ = proxy.send_event(UserEvent::Term(format!("\r\n$ {}\r\n", cmd)));
-            wait_for_server(proxy, handle, exited, last_term);
+            wait_for_server(proxy, handle, exited, last_term, server_url);
         }
         Err(e) => {
             let _ = proxy.send_event(UserEvent::Fatal(format!("启动命令失败: {}", e)));
@@ -165,6 +193,7 @@ fn wait_for_server(
     handle: Arc<Mutex<Option<ServerHandle>>>,
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) {
     let mut ready = false;
     let mut last_beat: Option<Instant> = None;
@@ -210,8 +239,54 @@ fn wait_for_server(
     }
 
     if ready {
-        let _ = proxy.send_event(UserEvent::Status("服务已就绪，正在打开页面…".into()));
-        let _ = proxy.send_event(UserEvent::ServerReady);
+        dbg_log("PORT_READY");
+        // The port is up but the `dsh web: <url>` line may not have been
+        // read yet — wait for the reader thread to parse the authenticated
+        // URL before falling back to the bare port. NOTE: the lock guard must
+        // be dropped before entering the wait loop; re-locking inside
+        // `unwrap_or_else` on the same statement would deadlock (the temporary
+        // guard lives until the statement ends).
+        let mut parsed: Option<String> = server_url.lock().unwrap().clone();
+        if parsed.is_none() {
+            let _ = proxy.send_event(UserEvent::Status(
+                "服务端口已就绪，正在等待认证 URL…".into()
+            ));
+            // The bare port is useless when the server requires a token (it
+            // renders an "authentication required" page), so wait generously —
+            // some dsh builds keep the port listening for a while before the
+            // token URL is printed.
+            for i in 0..300 {
+                if exited.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+                parsed = server_url.lock().unwrap().clone();
+                if parsed.is_some() {
+                    break;
+                }
+                if i > 0 && i % 30 == 0 {
+                    let _ = proxy.send_event(UserEvent::Status(format!(
+                        "仍在等待认证 URL（{}s），可在上方终端查看 dsh 输出…",
+                        i / 10
+                    )));
+                }
+            }
+        }
+        let url = parsed.unwrap_or_else(|| {
+            dbg_log("GRACE_EXPIRED_NO_URL -> fallback bare URL + watcher");
+            // Last resort: open the bare URL (it may show an auth-required
+            // page) but keep watching for the authenticated URL in the
+            // background — as soon as it is parsed we re-navigate, which
+            // recovers the view without any user action.
+            spawn_late_url_watcher(proxy.clone(), server_url.clone(), exited.clone());
+            let _ = proxy.send_event(UserEvent::Status(
+                "暂未获取到认证 URL，先用默认地址打开；解析到认证地址后会自动跳转…".into()
+            ));
+            TARGET_URL.to_string()
+        });
+        dbg_log(&format!("NAVIGATE: {}", url));
+        let _ = proxy.send_event(UserEvent::Status(format!("正在打开页面: {}", url)));
+        let _ = proxy.send_event(UserEvent::ServerReady(url));
     } else {
         let msg = if exited.load(Ordering::SeqCst) {
             "命令已退出，但 127.0.0.1:3080 未就绪。请查看上方终端输出，按需输入指令后重启应用重试。"
@@ -220,6 +295,66 @@ fn wait_for_server(
         };
         let _ = proxy.send_event(UserEvent::Fatal(msg.into()));
     }
+}
+
+/// Keep watching for the authenticated URL after the webview already opened
+/// the bare port (last-resort fallback). Some dsh builds print the token URL
+/// well after the port starts listening; when it finally shows up we
+/// re-navigate the webview so the user never has to copy the token manually.
+fn spawn_late_url_watcher(
+    proxy: EventLoopProxy<UserEvent>,
+    server_url: Arc<Mutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        // Watch for up to 10 minutes; the reader thread fills `server_url`
+        // whenever the token URL appears in the child's output.
+        for _ in 0..1200 {
+            if exited.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(u) = server_url.lock().unwrap().clone() {
+                dbg_log(&format!("WATCHER_NAVIGATE: {}", u));
+                let _ = proxy.send_event(UserEvent::Status(
+                    "已获取认证 URL，正在重新打开页面…".into(),
+                ));
+                let _ = proxy.send_event(UserEvent::ServerReady(u));
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+/// Extract the authenticated server URL from one output line. Matches the
+/// canonical `dsh web: http://127.0.0.1:3080/?token=…` prefix, and — as a
+/// fallback for future output-format changes — any http(s) URL pointing at
+/// our port that carries a `token=` query parameter.
+fn parse_server_url(line: &str) -> Option<String> {
+    if let Some(pos) = line.find("dsh web:") {
+        let rest = &line[pos + "dsh web:".len()..];
+        if let Some(url) = rest.trim().split_whitespace().next() {
+            if url.starts_with("http") {
+                return Some(url.to_string());
+            }
+        }
+    }
+    let mut idx = 0;
+    while let Some(pos) = line[idx..].find("http") {
+        let cand = &line[idx + pos..];
+        let url = cand
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(|c: char| matches!(c, '\r' | ',' | ')' | '.' | ';' | '"'));
+        if (url.contains("127.0.0.1:3080") || url.contains("localhost:3080"))
+            && url.contains("token=")
+        {
+            return Some(url.to_string());
+        }
+        idx += pos + 4;
+    }
+    None
 }
 
 /// Heuristically detect that the command is prompting for a yes/no confirmation
@@ -323,13 +458,14 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(unix)]
 fn start_command_pty(
-    npx: &Path,
+    spec: &LaunchSpec,
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
     user_took_over: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) -> io::Result<()> {
     use std::ptr;
     use std::os::unix::ffi::OsStrExt as _;
@@ -338,22 +474,28 @@ fn start_command_pty(
         CString::new(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
     };
 
-    let cpath = cz(npx.as_os_str().as_bytes())?;
+    let cpath = cz(spec.program.as_os_str().as_bytes())?;
     let mut cstrings: Vec<CString> = vec![cpath];
     let mut argv: Vec<*const libc::c_char> = vec![cstrings[0].as_ptr()];
-    for a in ARGS {
+    for a in &spec.args {
         let cs = cz(a.as_bytes())?;
         argv.push(cs.as_ptr());
         cstrings.push(cs);
     }
     argv.push(ptr::null());
 
-    let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    // Put the runtime's dir (node/npx) first on PATH so dsh can spawn `node`
+    // for child processes even in a GUI .app with a minimal environment.
+    let bin_dir = spec
+        .program
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let inherited = std::env::var("PATH").unwrap_or_default();
-    let new_path = if npx_dir.is_empty() {
+    let new_path = if bin_dir.is_empty() {
         inherited
     } else {
-        format!("{}:{}", npx_dir, inherited)
+        format!("{}:{}", bin_dir, inherited)
     };
     let node_opts = filter_node_options();
 
@@ -420,11 +562,15 @@ fn start_command_pty(
         let rauto_in = input_writer.clone();
         let rauto_took = user_took_over.clone();
         let rlast = last_term.clone();
+        let rurl = server_url.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             // Accumulate raw bytes so multi-byte UTF-8 chars that span two
             // reads are not decoded mid-character (which produces garbage).
             let mut carry: Vec<u8> = Vec::with_capacity(1024);
+            // Accumulate incomplete lines (no newline yet) so a URL printed
+            // across two PTY reads is parsed as one piece, not two fragments.
+            let mut line_buf = String::new();
             let mut last_auto: Option<Instant> = None;
             // Rolling window of recent output lines — used to surface the
             // *actual* question text when the command asks for confirmation.
@@ -460,8 +606,27 @@ fn start_command_pty(
                     // so we can (a) detect prompts and (b) surface the literal
                     // question text without escape codes.
                     let plain = strip_ansi(&chunk);
-                    for line in plain.lines() {
-                        recent_lines.push(line.to_string());
+                    line_buf.push_str(&plain);
+                    // Split on '\r' OR '\n': some CLI output terminates lines
+                    // with a bare carriage return (progress redraws), and the
+                    // token URL must not stay trapped in an unterminated line.
+                    while let Some(nl) =
+                        line_buf.find(|c: char| c == '\n' || c == '\r')
+                    {
+                        let line = line_buf[..nl].to_string();
+                        line_buf.drain(..=nl);
+                        if line.trim().is_empty() {
+                            continue; // \r\n leaves an empty second line
+                        }
+                        dbg_log(&format!("LINE: {}", line));
+                        recent_lines.push(line.clone());
+                        // Parse the authenticated URL printed by
+                        // `dsh web: http://127.0.0.1:3080?token=…`
+                        // so the webview can navigate to it instead of the
+                        // bare port (which would show a blank page).
+                        if let Some(url) = parse_server_url(&line) {
+                            *rurl.lock().unwrap() = Some(url);
+                        }
                     }
                     if recent_lines.len() > 20 {
                         recent_lines.drain(..recent_lines.len() - 20);
@@ -488,6 +653,7 @@ fn start_command_pty(
                     }
                 }
             }
+            dbg_log("READER_EXIT");
             rexit.store(true, Ordering::SeqCst);
             let _ = rproxy.send_event(UserEvent::TermDone("进程已退出".into()));
             let _ = libc::close(rmaster);
@@ -499,20 +665,25 @@ fn start_command_pty(
 
 #[cfg(windows)]
 fn start_command_piped(
-    npx: &Path,
+    spec: &LaunchSpec,
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
     _user_took_over: Arc<AtomicBool>,
     _exited: Arc<AtomicBool>,
     _last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) -> io::Result<()> {
-    let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let bin_dir = spec
+        .program
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let inherited = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{};{}", npx_dir, inherited);
+    let new_path = format!("{};{}", bin_dir, inherited);
 
-    let mut child = Command::new(npx)
-        .args(ARGS)
+    let mut child = Command::new(&spec.program)
+        .args(&spec.args)
         .env("PATH", new_path)
         .env("NODE_OPTIONS", filter_node_options())
         .env("npm_config_yes", "true")
@@ -520,7 +691,7 @@ fn start_command_piped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("启动 npx 失败: {}", e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("启动命令失败: {}", e)))?;
 
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -528,13 +699,13 @@ fn start_command_piped(
     *input_writer.lock().unwrap() = Some(Box::new(stdin));
     *handle.lock().unwrap() = Some(ServerHandle { child });
 
-    spawn_reader(stdout, proxy.clone());
-    spawn_reader(stderr, proxy.clone());
+    spawn_reader(stdout, proxy.clone(), server_url.clone());
+    spawn_reader(stderr, proxy.clone(), server_url);
     Ok(())
 }
 
 #[cfg(windows)]
-fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProxy<UserEvent>) {
+fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProxy<UserEvent>, server_url: Arc<Mutex<Option<String>>>) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -542,6 +713,12 @@ fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProx
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let plain = strip_ansi(&chunk);
+                    for line in plain.lines() {
+                        if let Some(url) = parse_server_url(line) {
+                            *server_url.lock().unwrap() = Some(url);
+                        }
+                    }
                     let _ = proxy.send_event(UserEvent::Term(chunk));
                 }
                 Err(_) => break,
@@ -560,4 +737,34 @@ fn filter_node_options() -> String {
         .filter(|tok| !tok.starts_with("--use-system-ca"))
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_dsh_output() {
+        // Real captured line: spinner chars + ANSI-free plain text, \r\n split off.
+        let line = "⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋dsh web: http://127.0.0.1:3080/?token=3I3a0EnMMRmHOqnVxOSLFhorURk-N8xCSYuvEvsikY0";
+        assert_eq!(
+            parse_server_url(line).unwrap(),
+            "http://127.0.0.1:3080/?token=3I3a0EnMMRmHOqnVxOSLFhorURk-N8xCSYuvEvsikY0"
+        );
+    }
+
+    #[test]
+    fn parses_url_without_prefix() {
+        let line = "Open in browser: http://localhost:3080/?token=abc123, enjoy!";
+        assert_eq!(
+            parse_server_url(line).unwrap(),
+            "http://localhost:3080/?token=abc123"
+        );
+    }
+
+    #[test]
+    fn ignores_noise() {
+        assert!(parse_server_url("npm warn deprecated foo@1.0.0").is_none());
+        assert!(parse_server_url("http://127.0.0.1:3080 no token here").is_none());
+    }
 }

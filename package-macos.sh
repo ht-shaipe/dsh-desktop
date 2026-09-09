@@ -12,13 +12,19 @@ ICNS="icon/AppIcon.icns"
 OUT="$APP_NAME.app"
 
 # 1. Build the optimized binary. Honour DSH_BIN (set by CI for cross-arch
-# builds) to skip the build step and bundle a prebuilt binary instead.
+#    builds) to skip the build step and bundle a prebuilt binary instead.
 if [ -n "${DSH_BIN:-}" ] && [ -f "${DSH_BIN}" ]; then
   BIN="${DSH_BIN}"
 else
   cargo build --release
   BIN="target/release/$APP_NAME"
 fi
+
+# 1b. Vendor the pinned @deepseek-ai/dsh package (no npx / no network for
+#     dsh itself at runtime). Node is NOT bundled: the app resolves a system
+#     Node >= 22.15 at launch, else downloads a portable one to ~/.cache.
+#     See vendor-dsh.sh.
+./vendor-dsh.sh
 
 # 2. Generate an .icns from the PNG (only if missing).
 if [ ! -f "$ICNS" ]; then
@@ -41,6 +47,9 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp "$BIN" "$OUT/Contents/MacOS/$APP_NAME"
 cp "$ICNS" "$OUT/Contents/Resources/AppIcon.icns"
+
+# 3b. Bundle the vendored dsh package (Node is resolved at runtime).
+cp -R vendor/dsh "$OUT/Contents/Resources/dsh"
 
 cat > "$OUT/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

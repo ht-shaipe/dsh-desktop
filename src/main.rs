@@ -25,10 +25,6 @@ use tao::{
 use wry::WebViewBuilder;
 
 // ---- Configuration -------------------------------------------------------
-/// Arguments passed to `npx`. The `-y` auto-confirms the one-time package
-/// install so the command never hangs waiting for input when launched from a
-/// GUI `.app` (where stdin is not a TTY).
-pub const ARGS: &[&str] = &["-y", "@deepseek-ai/dsh", "web"];
 /// The local server the launched command exposes.
 pub const TARGET_URL: &str = "http://127.0.0.1:3080";
 /// Host:port we poll to know when the server is ready.
@@ -94,7 +90,7 @@ pub enum UserEvent {
     /// The child process exited.
     TermDone(String),
     /// Server is up; navigate the webview to it.
-    ServerReady,
+    ServerReady(String),
     /// Fatal error — show it in the window.
     Fatal(String),
 }
@@ -196,11 +192,20 @@ fn main() {
                     let msg = format!("\r\n[{}]\r\n", s);
                     let _ = webview.evaluate_script(&format!("appendTerm({})", ui::js_string_arg(&msg)));
                 }
-                UserEvent::ServerReady => {
-                    let _ = webview.evaluate_script(&format!(
-                        "window.location.href = '{}';",
-                        TARGET_URL
-                    ));
+                UserEvent::ServerReady(url) => {
+                    crate::terminal::dbg_log(&format!("SERVER_READY_EVENT: {}", url));
+                    // Native navigation (load_url) instead of
+                    // `window.location.href` via evaluate_script: the terminal
+                    // view has a null origin, and a JS-initiated cross-origin
+                    // jump interacts badly with the server's
+                    // SameSite=Strict auth cookie on WKWebView.
+                    if let Err(e) = webview.load_url(&url) {
+                        crate::terminal::dbg_log(&format!("LOAD_URL_ERR: {}", e));
+                        let _ = webview.evaluate_script(&format!(
+                            "window.location.href = '{}';",
+                            url
+                        ));
+                    }
                 }
                 UserEvent::Fatal(msg) => {
                     // Keep the interactive terminal on screen and just overlay a

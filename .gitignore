@@ -20,3 +20,6 @@ icon.iconset/
 .idea/
 .vscode/
 *.swp
+.codeartsdoer
+vendor/
+build

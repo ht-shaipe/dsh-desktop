@@ -16,7 +16,155 @@ use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
 
 use crate::{InputSink, ServerHandle, UserEvent};
-use crate::terminal::launch_terminal;
+use crate::terminal::{dbg_log, launch_terminal};
+
+/// The fully-resolved command that launches the dsh web server.
+/// Packaged mode runs the bundled Node against the vendored dsh entry;
+/// fallback (dev) mode runs `npx -y @deepseek-ai/dsh web`.
+pub struct LaunchSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl LaunchSpec {
+    /// The command as displayed in the terminal echo, e.g.
+    /// `/…/node /…/bin.js web --no-open`.
+    pub fn display(&self) -> String {
+        format!("{} {}", self.program.display(), self.args.join(" "))
+    }
+}
+
+/// Arguments for the npx fallback path. `-y` auto-confirms the one-time
+/// package install; `--no-open` keeps dsh from launching a system browser
+/// (the app's webview opens the page itself).
+const NPX_ARGS: &[&str] = &["-y", "@deepseek-ai/dsh", "web", "--no-open"];
+
+fn npx_spec(npx: PathBuf) -> LaunchSpec {
+    LaunchSpec {
+        program: npx,
+        args: NPX_ARGS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Locate the dsh package bundled inside the .app
+/// (`Contents/Resources/dsh`). Node is NOT bundled — it is resolved at
+/// runtime (system Node >= 22.15 first, else the portable build in ~/.cache,
+/// downloaded on first run). Returns `None` when running outside a packaged
+/// app (e.g. `cargo run`), so the npx fallback stays available for
+/// development. Set `DSH_SKIP_BUNDLED=1` to force the fallback.
+fn bundled_dsh_bin() -> Option<PathBuf> {
+    if std::env::var_os("DSH_SKIP_BUNDLED").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    // <app>/Contents/MacOS/dsh-desktop -> <app>/Contents/Resources
+    let resources = exe.parent()?.parent()?.join("Resources");
+    let dsh_bin = resources
+        .join("dsh")
+        .join("node_modules/@deepseek-ai/dsh/lib/bin.js");
+    if !dsh_bin.is_file() {
+        return None;
+    }
+    dbg_log(&format!("BUNDLED_DSH: {}", dsh_bin.display()));
+    Some(dsh_bin)
+}
+
+/// Resolve a Node runtime for the bundled dsh: prefer a system Node that
+/// meets the minimum version, else use (and download if missing) the portable
+/// build in ~/.cache. Reports progress through `proxy`; returns `None` only
+/// after surfacing a fatal error.
+fn resolve_bundled_node(proxy: &EventLoopProxy<UserEvent>) -> Option<PathBuf> {
+    if let Some(node) = resolve_system_node() {
+        let _ = proxy.send_event(UserEvent::Term(format!(
+            "✓ Node.js 运行环境 (系统): {}\r\n",
+            node.display()
+        )));
+        return Some(node);
+    }
+    let _ = proxy.send_event(UserEvent::Term(
+        "✗ 未找到满足要求的系统 Node.js（需 >= v22.15），正在准备便携版…\r\n".into(),
+    ));
+    let target = node_target();
+    let cache = match node_cache_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = proxy.send_event(UserEvent::Fatal(e));
+            return None;
+        }
+    };
+    let home = cache.join(format!("node-v{}-{}", crate::NODE_VERSION, target));
+    let node = node_bin_path(&home);
+    if !node.is_file() {
+        match download_and_extract_node(&target, &cache, proxy) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = proxy.send_event(UserEvent::Fatal(e));
+                return None;
+            }
+        }
+    }
+    if node.is_file() {
+        let _ = proxy.send_event(UserEvent::Term(format!(
+            "✓ Node.js 运行环境 (便携版): {}\r\n",
+            node.display()
+        )));
+        Some(node)
+    } else {
+        let _ = proxy.send_event(UserEvent::Fatal(
+            "未能在自动安装的 Node.js 中找到 node 可执行文件，安装失败。".into(),
+        ));
+        None
+    }
+}
+
+/// Find a `node` binary on the machine that meets the minimum version:
+/// the `DSH_NODE` override first, then the sibling `node` of every known
+/// npx candidate location. A GUI `.app` gets a minimal `PATH`, so we probe
+/// common locations explicitly instead of trusting `PATH`.
+fn resolve_system_node() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DSH_NODE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for c in npx_candidates() {
+        let Some(dir) = c.parent() else { continue };
+        let node = if cfg!(windows) {
+            dir.join("node.exe")
+        } else {
+            dir.join("node")
+        };
+        if !node.is_file() {
+            continue;
+        }
+        if let Some(v) = node_version(&node) {
+            if node_meets_min(v) {
+                return Some(node);
+            }
+        }
+    }
+    None
+}
+
+/// Run `node --version` and parse it, e.g. `v22.15.0` -> (22, 15, 0).
+fn node_version(node: &Path) -> Option<(u32, u32, u32)> {
+    let out = Command::new(node).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_node_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Path of the `node` executable inside an extracted portable Node dist.
+#[cfg(windows)]
+fn node_bin_path(home: &Path) -> PathBuf {
+    home.join("node.exe")
+}
+#[cfg(not(windows))]
+fn node_bin_path(home: &Path) -> PathBuf {
+    home.join("bin").join("node")
+}
 
 /// Full startup sequence: check the environment, list what's missing,
 /// auto-install Node.js if needed, then launch the server in an interactive
@@ -33,6 +181,34 @@ pub fn run_environment_flow(
     let _ = proxy.send_event(UserEvent::EnterTerminal);
     let _ = proxy.send_event(UserEvent::Term("=== 启动前环境自检 ===\r\n".into()));
     let _ = proxy.send_event(UserEvent::Status("正在检查运行环境…".into()));
+
+    // --- 0. Packaged mode: dsh bundled in the .app ----------------------
+    if let Some(dsh_bin) = bundled_dsh_bin() {
+        let _ = proxy.send_event(UserEvent::Term(
+            "✓ 使用应用内置的 dsh 包（无需 npx，无需联网获取 dsh）\r\n".into(),
+        ));
+        let node = match resolve_bundled_node(&proxy) {
+            Some(n) => n,
+            None => return,
+        };
+        let _ = proxy.send_event(UserEvent::Term("✓ 运行环境就绪，准备启动服务…\r\n".into()));
+        launch_terminal(
+            LaunchSpec {
+                program: node,
+                args: vec![
+                    dsh_bin.to_string_lossy().into_owned(),
+                    "web".into(),
+                    "--no-open".into(),
+                ],
+            },
+            proxy,
+            handle,
+            input_writer,
+            user_took_over,
+            exited,
+        );
+        return;
+    }
 
     // --- 1. Environment check -------------------------------------------
     let node = resolve_npx();
@@ -93,7 +269,7 @@ pub fn run_environment_flow(
     // --- 2. Fast path: a usable Node is already present ----------------
     if let Some(npx) = usable_npx {
         let _ = proxy.send_event(UserEvent::Term("✓ 运行环境就绪，准备启动服务…\r\n".into()));
-        launch_terminal(npx, proxy, handle, input_writer, user_took_over, exited);
+        launch_terminal(npx_spec(npx), proxy, handle, input_writer, user_took_over, exited);
         return;
     }
 
@@ -127,7 +303,7 @@ pub fn run_environment_flow(
             "✓ 已安装 Node.js: {}\r\n",
             npx.display()
         )));
-        launch_terminal(npx, proxy, handle, input_writer, user_took_over, exited);
+        launch_terminal(npx_spec(npx), proxy, handle, input_writer, user_took_over, exited);
     } else {
         let _ = proxy.send_event(UserEvent::Fatal(
             "未能在自动安装的 Node.js 中找到 npx，安装失败。".into(),
