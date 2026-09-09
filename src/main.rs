@@ -28,7 +28,7 @@ use wry::WebViewBuilder;
 /// Arguments passed to `npx`. The `-y` auto-confirms the one-time package
 /// install so the command never hangs waiting for input when launched from a
 /// GUI `.app` (where stdin is not a TTY).
-pub const ARGS: &[&str] = &["-y", "@deepseek-ai/dsh", "web"];
+pub const ARGS: &[&str] = &["-y", "@deepseek-ai/dsh", "web", "--no-open"];
 /// The local server the launched command exposes.
 pub const TARGET_URL: &str = "http://127.0.0.1:3080";
 /// Host:port we poll to know when the server is ready.
@@ -94,7 +94,7 @@ pub enum UserEvent {
     /// The child process exited.
     TermDone(String),
     /// Server is up; navigate the webview to it.
-    ServerReady,
+    ServerReady(String),
     /// Fatal error — show it in the window.
     Fatal(String),
 }
@@ -196,10 +196,10 @@ fn main() {
                     let msg = format!("\r\n[{}]\r\n", s);
                     let _ = webview.evaluate_script(&format!("appendTerm({})", ui::js_string_arg(&msg)));
                 }
-                UserEvent::ServerReady => {
+                UserEvent::ServerReady(url) => {
                     let _ = webview.evaluate_script(&format!(
                         "window.location.href = '{}';",
-                        TARGET_URL
+                        url
                     ));
                 }
                 UserEvent::Fatal(msg) => {

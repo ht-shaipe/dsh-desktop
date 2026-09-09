@@ -22,7 +22,7 @@ use std::process::{Child, Stdio};
 
 use tao::event_loop::EventLoopProxy;
 
-use crate::{ARGS, POLL_ADDR, InputSink, ServerHandle, UserEvent};
+use crate::{ARGS, POLL_ADDR, TARGET_URL, InputSink, ServerHandle, UserEvent};
 
 /// Wraps a raw file descriptor so we can write user keystrokes into the PTY.
 #[cfg(unix)]
@@ -57,6 +57,13 @@ pub fn launch_terminal(
     // "still working" heartbeat while npm downloads dependencies silently
     // (CI + non-TTY mode suppresses its progress output).
     let last_term = Arc::new(Mutex::new(Instant::now()));
+    // The authenticated URL printed by `dsh web` (e.g.
+    // `dsh web: http://127.0.0.1:3080?token=…`). Parsed from the child's
+    // stdout by the reader thread and consumed by `wait_for_server` so the
+    // webview navigates to the token-bearing URL instead of the bare port
+    // (which would render a blank page — the server rejects unauthenticated
+    // requests).
+    let server_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // The environment flow already switched the view to the interactive terminal
     // and logged the "准备启动" phase, so here we just make sure the view is up
@@ -81,6 +88,7 @@ pub fn launch_terminal(
         user_took_over.clone(),
         exited.clone(),
         last_term.clone(),
+        server_url.clone(),
     );
     #[cfg(windows)]
     let started = start_command_piped(
@@ -91,6 +99,7 @@ pub fn launch_terminal(
         user_took_over.clone(),
         exited.clone(),
         last_term.clone(),
+        server_url.clone(),
     );
 
     match started {
@@ -99,7 +108,7 @@ pub fn launch_terminal(
             // Echo the command being run so the terminal reads like a real shell.
             *last_term.lock().unwrap() = Instant::now();
             let _ = proxy.send_event(UserEvent::Term(format!("\r\n$ {}\r\n", cmd)));
-            wait_for_server(proxy, handle, exited, last_term);
+            wait_for_server(proxy, handle, exited, last_term, server_url);
         }
         Err(e) => {
             let _ = proxy.send_event(UserEvent::Fatal(format!("启动命令失败: {}", e)));
@@ -165,6 +174,7 @@ fn wait_for_server(
     handle: Arc<Mutex<Option<ServerHandle>>>,
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) {
     let mut ready = false;
     let mut last_beat: Option<Instant> = None;
@@ -210,8 +220,9 @@ fn wait_for_server(
     }
 
     if ready {
+        let url = server_url.lock().unwrap().clone().unwrap_or_else(|| TARGET_URL.to_string());
         let _ = proxy.send_event(UserEvent::Status("服务已就绪，正在打开页面…".into()));
-        let _ = proxy.send_event(UserEvent::ServerReady);
+        let _ = proxy.send_event(UserEvent::ServerReady(url));
     } else {
         let msg = if exited.load(Ordering::SeqCst) {
             "命令已退出，但 127.0.0.1:3080 未就绪。请查看上方终端输出，按需输入指令后重启应用重试。"
@@ -330,6 +341,7 @@ fn start_command_pty(
     user_took_over: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) -> io::Result<()> {
     use std::ptr;
     use std::os::unix::ffi::OsStrExt as _;
@@ -420,6 +432,7 @@ fn start_command_pty(
         let rauto_in = input_writer.clone();
         let rauto_took = user_took_over.clone();
         let rlast = last_term.clone();
+        let rurl = server_url.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             // Accumulate raw bytes so multi-byte UTF-8 chars that span two
@@ -462,6 +475,18 @@ fn start_command_pty(
                     let plain = strip_ansi(&chunk);
                     for line in plain.lines() {
                         recent_lines.push(line.to_string());
+                        // Parse the authenticated URL printed by
+                        // `dsh web: http://127.0.0.1:3080?token=…`
+                        // so the webview can navigate to it instead of the
+                        // bare port (which would show a blank page).
+                        if let Some(rest) = line.strip_prefix("dsh web:") {
+                            let url = rest.trim().split_whitespace().next();
+                            if let Some(url) = url {
+                                if url.starts_with("http") {
+                                    *rurl.lock().unwrap() = Some(url.to_string());
+                                }
+                            }
+                        }
                     }
                     if recent_lines.len() > 20 {
                         recent_lines.drain(..recent_lines.len() - 20);
@@ -506,6 +531,7 @@ fn start_command_piped(
     _user_took_over: Arc<AtomicBool>,
     _exited: Arc<AtomicBool>,
     _last_term: Arc<Mutex<Instant>>,
+    server_url: Arc<Mutex<Option<String>>>,
 ) -> io::Result<()> {
     let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let inherited = std::env::var("PATH").unwrap_or_default();
@@ -528,13 +554,13 @@ fn start_command_piped(
     *input_writer.lock().unwrap() = Some(Box::new(stdin));
     *handle.lock().unwrap() = Some(ServerHandle { child });
 
-    spawn_reader(stdout, proxy.clone());
-    spawn_reader(stderr, proxy.clone());
+    spawn_reader(stdout, proxy.clone(), server_url.clone());
+    spawn_reader(stderr, proxy.clone(), server_url);
     Ok(())
 }
 
 #[cfg(windows)]
-fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProxy<UserEvent>) {
+fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProxy<UserEvent>, server_url: Arc<Mutex<Option<String>>>) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -542,6 +568,16 @@ fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProx
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    for line in chunk.lines() {
+                        if let Some(rest) = line.strip_prefix("dsh web:") {
+                            let url = rest.trim().split_whitespace().next();
+                            if let Some(url) = url {
+                                if url.starts_with("http") {
+                                    *server_url.lock().unwrap() = Some(url.to_string());
+                                }
+                            }
+                        }
+                    }
                     let _ = proxy.send_event(UserEvent::Term(chunk));
                 }
                 Err(_) => break,
