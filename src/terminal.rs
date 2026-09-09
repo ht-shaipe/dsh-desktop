@@ -24,6 +24,23 @@ use tao::event_loop::EventLoopProxy;
 
 use crate::{ARGS, POLL_ADDR, TARGET_URL, InputSink, ServerHandle, UserEvent};
 
+/// Append-only debug log used to diagnose startup/auth issues; safe to call
+/// from any thread, never panics. Located in /tmp so users can share it.
+pub fn dbg_log(msg: &str) {
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dsh-desktop-debug.log")
+    {
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
 /// Wraps a raw file descriptor so we can write user keystrokes into the PTY.
 #[cfg(unix)]
 struct FdWriter(RawFd);
@@ -53,6 +70,7 @@ pub fn launch_terminal(
     exited: Arc<AtomicBool>,
 ) {
     let cmd = format!("{} {}", npx.display(), ARGS.join(" "));
+    dbg_log(&format!("LAUNCH: {}", cmd));
     // Activity timestamp shared with the reader + server poller. Used to show a
     // "still working" heartbeat while npm downloads dependencies silently
     // (CI + non-TTY mode suppresses its progress output).
@@ -220,8 +238,53 @@ fn wait_for_server(
     }
 
     if ready {
-        let url = server_url.lock().unwrap().clone().unwrap_or_else(|| TARGET_URL.to_string());
-        let _ = proxy.send_event(UserEvent::Status("服务已就绪，正在打开页面…".into()));
+        dbg_log("PORT_READY");
+        // The port is up but the `dsh web: <url>` line may not have been
+        // read yet — wait for the reader thread to parse the authenticated
+        // URL before falling back to the bare port. NOTE: the lock guard must
+        // be dropped before entering the wait loop; re-locking inside
+        // `unwrap_or_else` on the same statement would deadlock (the temporary
+        // guard lives until the statement ends).
+        let mut parsed: Option<String> = server_url.lock().unwrap().clone();
+        if parsed.is_none() {
+            let _ = proxy.send_event(UserEvent::Status(
+                "服务端口已就绪，正在等待认证 URL…".into()
+            ));
+            // The bare port is useless when the server requires a token (it
+            // renders an "authentication required" page), so wait generously —
+            // some dsh builds keep the port listening for a while before the
+            // token URL is printed.
+            for i in 0..300 {
+                if exited.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+                parsed = server_url.lock().unwrap().clone();
+                if parsed.is_some() {
+                    break;
+                }
+                if i > 0 && i % 30 == 0 {
+                    let _ = proxy.send_event(UserEvent::Status(format!(
+                        "仍在等待认证 URL（{}s），可在上方终端查看 dsh 输出…",
+                        i / 10
+                    )));
+                }
+            }
+        }
+        let url = parsed.unwrap_or_else(|| {
+            dbg_log("GRACE_EXPIRED_NO_URL -> fallback bare URL + watcher");
+            // Last resort: open the bare URL (it may show an auth-required
+            // page) but keep watching for the authenticated URL in the
+            // background — as soon as it is parsed we re-navigate, which
+            // recovers the view without any user action.
+            spawn_late_url_watcher(proxy.clone(), server_url.clone(), exited.clone());
+            let _ = proxy.send_event(UserEvent::Status(
+                "暂未获取到认证 URL，先用默认地址打开；解析到认证地址后会自动跳转…".into()
+            ));
+            TARGET_URL.to_string()
+        });
+        dbg_log(&format!("NAVIGATE: {}", url));
+        let _ = proxy.send_event(UserEvent::Status(format!("正在打开页面: {}", url)));
         let _ = proxy.send_event(UserEvent::ServerReady(url));
     } else {
         let msg = if exited.load(Ordering::SeqCst) {
@@ -231,6 +294,66 @@ fn wait_for_server(
         };
         let _ = proxy.send_event(UserEvent::Fatal(msg.into()));
     }
+}
+
+/// Keep watching for the authenticated URL after the webview already opened
+/// the bare port (last-resort fallback). Some dsh builds print the token URL
+/// well after the port starts listening; when it finally shows up we
+/// re-navigate the webview so the user never has to copy the token manually.
+fn spawn_late_url_watcher(
+    proxy: EventLoopProxy<UserEvent>,
+    server_url: Arc<Mutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        // Watch for up to 10 minutes; the reader thread fills `server_url`
+        // whenever the token URL appears in the child's output.
+        for _ in 0..1200 {
+            if exited.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(u) = server_url.lock().unwrap().clone() {
+                dbg_log(&format!("WATCHER_NAVIGATE: {}", u));
+                let _ = proxy.send_event(UserEvent::Status(
+                    "已获取认证 URL，正在重新打开页面…".into(),
+                ));
+                let _ = proxy.send_event(UserEvent::ServerReady(u));
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+/// Extract the authenticated server URL from one output line. Matches the
+/// canonical `dsh web: http://127.0.0.1:3080/?token=…` prefix, and — as a
+/// fallback for future output-format changes — any http(s) URL pointing at
+/// our port that carries a `token=` query parameter.
+fn parse_server_url(line: &str) -> Option<String> {
+    if let Some(pos) = line.find("dsh web:") {
+        let rest = &line[pos + "dsh web:".len()..];
+        if let Some(url) = rest.trim().split_whitespace().next() {
+            if url.starts_with("http") {
+                return Some(url.to_string());
+            }
+        }
+    }
+    let mut idx = 0;
+    while let Some(pos) = line[idx..].find("http") {
+        let cand = &line[idx + pos..];
+        let url = cand
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(|c: char| matches!(c, '\r' | ',' | ')' | '.' | ';' | '"'));
+        if (url.contains("127.0.0.1:3080") || url.contains("localhost:3080"))
+            && url.contains("token=")
+        {
+            return Some(url.to_string());
+        }
+        idx += pos + 4;
+    }
+    None
 }
 
 /// Heuristically detect that the command is prompting for a yes/no confirmation
@@ -438,6 +561,9 @@ fn start_command_pty(
             // Accumulate raw bytes so multi-byte UTF-8 chars that span two
             // reads are not decoded mid-character (which produces garbage).
             let mut carry: Vec<u8> = Vec::with_capacity(1024);
+            // Accumulate incomplete lines (no newline yet) so a URL printed
+            // across two PTY reads is parsed as one piece, not two fragments.
+            let mut line_buf = String::new();
             let mut last_auto: Option<Instant> = None;
             // Rolling window of recent output lines — used to surface the
             // *actual* question text when the command asks for confirmation.
@@ -473,19 +599,26 @@ fn start_command_pty(
                     // so we can (a) detect prompts and (b) surface the literal
                     // question text without escape codes.
                     let plain = strip_ansi(&chunk);
-                    for line in plain.lines() {
-                        recent_lines.push(line.to_string());
+                    line_buf.push_str(&plain);
+                    // Split on '\r' OR '\n': some CLI output terminates lines
+                    // with a bare carriage return (progress redraws), and the
+                    // token URL must not stay trapped in an unterminated line.
+                    while let Some(nl) =
+                        line_buf.find(|c: char| c == '\n' || c == '\r')
+                    {
+                        let line = line_buf[..nl].to_string();
+                        line_buf.drain(..=nl);
+                        if line.trim().is_empty() {
+                            continue; // \r\n leaves an empty second line
+                        }
+                        dbg_log(&format!("LINE: {}", line));
+                        recent_lines.push(line.clone());
                         // Parse the authenticated URL printed by
                         // `dsh web: http://127.0.0.1:3080?token=…`
                         // so the webview can navigate to it instead of the
                         // bare port (which would show a blank page).
-                        if let Some(rest) = line.strip_prefix("dsh web:") {
-                            let url = rest.trim().split_whitespace().next();
-                            if let Some(url) = url {
-                                if url.starts_with("http") {
-                                    *rurl.lock().unwrap() = Some(url.to_string());
-                                }
-                            }
+                        if let Some(url) = parse_server_url(&line) {
+                            *rurl.lock().unwrap() = Some(url);
                         }
                     }
                     if recent_lines.len() > 20 {
@@ -513,6 +646,7 @@ fn start_command_pty(
                     }
                 }
             }
+            dbg_log("READER_EXIT");
             rexit.store(true, Ordering::SeqCst);
             let _ = rproxy.send_event(UserEvent::TermDone("进程已退出".into()));
             let _ = libc::close(rmaster);
@@ -568,14 +702,10 @@ fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProx
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    for line in chunk.lines() {
-                        if let Some(rest) = line.strip_prefix("dsh web:") {
-                            let url = rest.trim().split_whitespace().next();
-                            if let Some(url) = url {
-                                if url.starts_with("http") {
-                                    *server_url.lock().unwrap() = Some(url.to_string());
-                                }
-                            }
+                    let plain = strip_ansi(&chunk);
+                    for line in plain.lines() {
+                        if let Some(url) = parse_server_url(line) {
+                            *server_url.lock().unwrap() = Some(url);
                         }
                     }
                     let _ = proxy.send_event(UserEvent::Term(chunk));
@@ -596,4 +726,34 @@ fn filter_node_options() -> String {
         .filter(|tok| !tok.starts_with("--use-system-ca"))
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_dsh_output() {
+        // Real captured line: spinner chars + ANSI-free plain text, \r\n split off.
+        let line = "⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋dsh web: http://127.0.0.1:3080/?token=3I3a0EnMMRmHOqnVxOSLFhorURk-N8xCSYuvEvsikY0";
+        assert_eq!(
+            parse_server_url(line).unwrap(),
+            "http://127.0.0.1:3080/?token=3I3a0EnMMRmHOqnVxOSLFhorURk-N8xCSYuvEvsikY0"
+        );
+    }
+
+    #[test]
+    fn parses_url_without_prefix() {
+        let line = "Open in browser: http://localhost:3080/?token=abc123, enjoy!";
+        assert_eq!(
+            parse_server_url(line).unwrap(),
+            "http://localhost:3080/?token=abc123"
+        );
+    }
+
+    #[test]
+    fn ignores_noise() {
+        assert!(parse_server_url("npm warn deprecated foo@1.0.0").is_none());
+        assert!(parse_server_url("http://127.0.0.1:3080 no token here").is_none());
+    }
 }
