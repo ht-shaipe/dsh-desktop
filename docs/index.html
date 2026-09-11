@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>dsh-desktop — 把 DeepSeek dsh 装进桌面窗口</title>
+  <meta name="description" content="一个极简的 Rust 桌面壳，双击即用，自动拉起 DeepSeek dsh web，内嵌终端实时显示进度，跨平台自动发版。">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg-soft: #161b22;
+      --bg-card: #1c2128;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-2: #3fb950;
+      --accent-3: #d29922;
+      --danger: #f85149;
+      --radius: 12px;
+      --max: 960px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      background: var(--bg-card);
+      padding: 2px 7px;
+      border-radius: 6px;
+      font-size: 0.88em;
+      border: 1px solid var(--border);
+    }
+    .wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+
+    /* ── Hero ── */
+    header {
+      padding: 80px 0 56px;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      font-size: 2.8rem;
+      font-weight: 800;
+      letter-spacing: -1px;
+      margin-bottom: 12px;
+    }
+    header h1 .dash { color: var(--accent); }
+    header .tagline {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 32px;
+    }
+    .badges { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      padding: 5px 14px; border-radius: 20px; font-size: 0.85rem; color: var(--text-muted);
+    }
+    .badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .cta { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 28px; border-radius: var(--radius);
+      font-size: 1rem; font-weight: 600; cursor: pointer;
+      border: 1px solid transparent; transition: all .2s;
+    }
+    .btn-primary { background: var(--accent); color: #0d1117; }
+    .btn-primary:hover { background: #79b8ff; text-decoration: none; }
+    .btn-ghost { background: var(--bg-card); color: var(--text); border-color: var(--border); }
+    .btn-ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+    /* ── Section ── */
+    section { padding: 64px 0; border-bottom: 1px solid var(--border); }
+    section h2 {
+      font-size: 1.7rem; font-weight: 700; margin-bottom: 8px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    section h2 .num {
+      color: var(--accent); font-size: 1rem; font-weight: 500;
+      font-family: "SF Mono", monospace;
+    }
+    section .lead { color: var(--text-muted); margin-bottom: 36px; font-size: 1.02rem; }
+
+    /* ── Feature grid ── */
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
+    .card {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 24px;
+      transition: border-color .2s, transform .2s;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .card .icon { font-size: 1.5rem; margin-bottom: 10px; display: block; }
+    .card h3 { font-size: 1.1rem; margin-bottom: 6px; }
+    .card p { color: var(--text-muted); font-size: 0.92rem; }
+
+    /* ── Flow ── */
+    .flow { display: flex; flex-direction: column; gap: 0; }
+    .flow-step {
+      display: flex; gap: 16px; padding: 16px 0;
+      border-left: 2px solid var(--border); padding-left: 24px; margin-left: 12px;
+      position: relative;
+    }
+    .flow-step::before {
+      content: ""; position: absolute; left: -7px; top: 22px;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--bg); border: 2px solid var(--accent);
+    }
+    .flow-step:last-child { border-left-color: transparent; }
+    .flow-step .label { color: var(--accent); font-weight: 600; white-space: nowrap; }
+    .flow-step .desc { color: var(--text-muted); }
+
+    /* ── Code block ── */
+    .code-block {
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px 24px;
+      overflow-x: auto; margin: 16px 0;
+    }
+    .code-block pre { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.88rem; line-height: 1.6; }
+    .code-block .comment { color: var(--text-muted); }
+    .code-block .cmd { color: var(--accent-2); }
+    .code-block .path { color: var(--accent-2); }
+
+    /* ── Platform cards ── */
+    .platforms { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+    .platform {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px; text-align: center;
+    }
+    .platform .os { font-size: 1.3rem; margin-bottom: 6px; }
+    .platform .pkg { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 10px; }
+    .platform .note { color: var(--text-muted); font-size: 0.8rem; }
+
+    /* ── Tech stack ── */
+    .stack { display: flex; flex-wrap: wrap; gap: 10px; }
+    .stack span {
+      background: var(--bg-card); border: 1px solid var(--border);
+      padding: 6px 16px; border-radius: 8px; font-size: 0.9rem;
+    }
+    .stack span strong { color: var(--accent); }
+
+    /* ── Footer ── */
+    footer { padding: 48px 0; text-align: center; }
+    footer .links { display: flex; gap: 24px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
+    footer .copy { color: var(--text-muted); font-size: 0.85rem; }
+
+    @media (max-width: 600px) {
+      header h1 { font-size: 2rem; }
+      header .tagline { font-size: 1rem; }
+      section { padding: 48px 0; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════ Hero ═══════ -->
+<header>
+  <div class="wrap">
+    <h1>dsh<span class="dash">-</span>desktop</h1>
+    <p class="tagline">把 DeepSeek <code>dsh web</code> 装进一个原生桌面窗口——双击即用，关窗即停。</p>
+    <div class="badges">
+      <span class="badge"><span class="dot" style="background:var(--accent-2)"></span> Rust</span>
+      <span class="badge"><span class="dot" style="background:var(--accent)"></span> tao + wry</span>
+      <span class="badge"><span class="dot" style="background:var(--accent-3)"></span> 跨平台</span>
+      <span class="badge"><span class="dot" style="background:var(--danger)"></span> 自包含二进制</span>
+    </div>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/ht-shaipe/dsh-desktop/releases">⬇ 下载发布版</a>
+      <a class="btn btn-ghost" href="https://github.com/ht-shaipe/dsh-desktop">★ GitHub 源码</a>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════ 功能特性 ═══════ -->
+<section id="features">
+  <div class="wrap">
+    <h2><span class="num">01</span> 功能特性</h2>
+    <p class="lead">不是简单的"套壳浏览器"，而是一个真正可交付给非技术用户的桌面应用。</p>
+    <div class="grid">
+      <div class="card">
+        <span class="icon">⚡</span>
+        <h3>开箱即用</h3>
+        <p>双击 App，自动运行 <code>npx -y @deepseek-ai/dsh web</code>，无需手动敲命令、无需装 Node。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🖥️</span>
+        <h3>内置交互终端</h3>
+        <p>实时显示命令输出（彩色、进度条、光标移动），底部输入框可手动回复确认提示，行为与真实终端一致。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🤖</span>
+        <h3>智能自动应答</h3>
+        <p>检测到 <code>(y/N)</code> 确认时自动回复 <code>y</code>，黄色横幅原样展示问题文字，关闭回显避免噪音。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🔍</span>
+        <h3>环境自检 + 便携 Node</h3>
+        <p>启动前逐项检测环境；Node 版本过低或缺失时，自动从国内镜像下载便携版 v22.23.2，零额外配置。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🧹</span>
+        <h3>干净退出</h3>
+        <p>关闭窗口即 <code>killpg</code> 杀掉整个进程组（含 npx 拉起的 node 子进程），不留后台残留。</p>
+      </div>
+      <div class="card">
+        <span class="icon">📦</span>
+        <h3>自包含二进制</h3>
+        <p>HTML / JS / 图标全部 <code>include_str!</code> 编译期内嵌，产物完全自包含，各平台只需分发二进制本身。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ 工作原理 ═══════ -->
+<section id="how">
+  <div class="wrap">
+    <h2><span class="num">02</span> 工作原理</h2>
+    <p class="lead">从双击到看到界面，中间发生了什么？</p>
+    <div class="flow">
+      <div class="flow-step">
+        <span class="label">环境自检</span>
+        <span class="desc">→ 打印检测清单（✓/✗），找到 npx 则复用，否则自动下载便携版 Node.js</span>
+      </div>
+      <div class="flow-step">
+        <span class="label">启动命令</span>
+        <span class="desc">→ 以伪终端（PTY）运行 <code>npx -y @deepseek-ai/dsh web</code>，内置终端实时显示输出</span>
+      </div>
+      <div class="flow-step">
+        <span class="label">端口就绪</span>
+        <span class="desc">→ 轮询 <code>127.0.0.1:3080</code>，一旦就绪自动跳转，窗口显示 dsh 的 Web 界面</span>
+      </div>
+      <div class="flow-step">
+        <span class="label">关闭窗口</span>
+        <span class="desc">→ <code>killpg</code> 杀掉整个进程组，干净退出</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ 使用方式 ═══════ -->
+<section id="usage">
+  <div class="wrap">
+    <h2><span class="num">03</span> 怎么用</h2>
+    <p class="lead">到 Releases 页下载对应平台包，双击即可。</p>
+    <div class="platforms">
+      <div class="platform">
+        <div class="os">🍎 macOS</div>
+        <div class="pkg">.dmg（aarch64 / x86_64）</div>
+        <div class="note">拖入「应用程序」；首次被拦截右键「打开」或 <code>xattr -cr</code></div>
+      </div>
+      <div class="platform">
+        <div class="os">🐧 Linux</div>
+        <div class="pkg">.tar.gz</div>
+        <div class="note">解压后运行；需系统已装 <code>webkit2gtk-4.1</code></div>
+      </div>
+      <div class="platform">
+        <div class="os">🪟 Windows</div>
+        <div class="pkg">.zip</div>
+        <div class="note">解压后运行 .exe；Win11 自带 WebView2</div>
+      </div>
+    </div>
+    <div class="code-block">
+<pre><span class="comment"># 从源码构建运行</span>
+<span class="cmd">cargo</span> run --release
+
+<span class="comment"># 打包 macOS .app</span>
+<span class="cmd">./</span>package-macos.sh
+
+<span class="comment"># 打包可分发 .dmg</span>
+<span class="cmd">./</span>package-dmg.sh</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ 技术栈 ═══════ -->
+<section id="tech">
+  <div class="wrap">
+    <h2><span class="num">04</span> 技术栈</h2>
+    <p class="lead">和 Tauri 同源，但更底层、更轻量——因为要启动的是外部子进程，不是自己的前端。</p>
+    <div class="stack">
+      <span><strong>Rust</strong> 系统语言</span>
+      <span><strong>tao</strong> 0.30 窗口管理</span>
+      <span><strong>wry</strong> 0.49 原生 WebView</span>
+      <span><strong>libc::forkpty</strong> 伪终端（PTY）</span>
+      <span><strong>include_str!</strong> 编译期内嵌资源</span>
+      <span><strong>GitHub Actions</strong> 跨平台自动发版</span>
+    </div>
+    <div class="code-block">
+<pre><span class="path">src/</span>
+<span class="path">├── main.rs</span>        <span class="comment"># 入口：窗口/webview、事件循环、进程句柄</span>
+<span class="path">├── environment.rs</span> <span class="comment"># 环境自检 + 便携 Node 下载</span>
+<span class="path">├── terminal.rs</span>    <span class="comment"># PTY/管道启动子进程 + 输出读取</span>
+<span class="path">└── ui.rs</span>          <span class="comment"># HTML/JS 资源 + 字符串转义工具</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ Footer ═══════ -->
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/ht-shaipe/dsh-desktop">GitHub</a>
+      <a href="https://github.com/ht-shaipe/dsh-desktop/releases">Releases</a>
+      <a href="https://github.com/ht-shaipe/dsh-desktop/issues">Issues</a>
+      <a href="https://www.npmjs.com/package/@deepseek-ai/dsh">@deepseek-ai/dsh</a>
+    </div>
+    <p class="copy">dsh-desktop · 用 Rust 写的极简桌面壳</p>
+  </div>
+</footer>
+
+</body>
+</html>
