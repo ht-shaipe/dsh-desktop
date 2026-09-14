@@ -114,6 +114,9 @@ pub enum UserEvent {
     UpdateProgress(u8),
     /// 更新下载+安装完成，参数为版本 tag。
     UpdateDone(String),
+    /// 更新流程失败（下载/验签/安装），参数为简短提示文案。
+    /// 详细原因仍通过 `Term` 输出到启动页终端。
+    UpdateFailed(String),
 }
 
 /// 显示一个原生浮动提示窗口，2 秒后自动消失。
@@ -269,6 +272,10 @@ fn main() {
     // 独立的帮助窗口（窗口 + 其专属 WebView）。
     // 已存在时再次点击"帮助"只做聚焦；用户关闭后置 None，下次点击重新创建。
     let mut help_window: Option<(tao::window::Window, wry::WebView)> = None;
+    // 主 webview 是否已跳转到 dsh web 界面。
+    // 跳转后我们注入的自定义 JS（showUpdateDialog 等）已被整页替换，
+    // 更新相关的 UI 反馈必须改走原生 toast / 后台下载。
+    let mut at_dsh_web = false;
 
     event_loop.run(move |event, el_target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -321,6 +328,8 @@ fn main() {
                 }
                 UserEvent::ServerReady(url) => {
                     crate::terminal::dbg_log(&format!("SERVER_READY_EVENT: {}", url));
+                    // 标记：主页面即将离开启动页，自定义 JS 将不再可用。
+                    at_dsh_web = true;
                     // 使用原生导航（load_url）而不是通过 evaluate_script 执行
                     // `window.location.href`：终端视图的 origin 为 null，由 JS
                     // 发起的跨源跳转会与服务器 SameSite=Strict 的认证 cookie
@@ -355,15 +364,42 @@ fn main() {
                     });
                 }
                 UserEvent::UpdateAvailable(tag, notes) => {
-                    let _ = webview.evaluate_script(&format!(
-                        "showUpdateDialog({}, {})",
-                        ui::js_string_arg(&tag),
-                        ui::js_string_arg(&notes),
-                    ));
+                    if at_dsh_web {
+                        // 主页面已是 dsh web 界面：我们注入的 JS（showUpdateDialog）
+                        // 已被整页替换，确认对话框无处显示。改为原生 toast 提示
+                        // + 直接后台下载安装，完成后再次 toast 提示重启。
+                        #[cfg(target_os = "macos")]
+                        {
+                            let t = format!("发现新版本 {}，正在后台下载更新…", tag);
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast(&t)));
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = webview.evaluate_script(&format!(
+                            "if (typeof showUpdateToast === 'function') showUpdateToast('发现新版本 {}，正在后台下载更新…')",
+                            tag
+                        ));
+                        let apply_proxy = proxy.clone();
+                        let apply_tag = tag.clone();
+                        thread::spawn(move || {
+                            updater::apply_update(&apply_tag, &apply_proxy);
+                        });
+                    } else {
+                        // 仍在启动页：显示确认对话框（让用户决定是否立即更新）。
+                        let _ = webview.evaluate_script(&format!(
+                            "if (typeof showUpdateDialog === 'function') showUpdateDialog({}, {})",
+                            ui::js_string_arg(&tag),
+                            ui::js_string_arg(&notes),
+                        ));
+                    }
                     let _ = webview.evaluate_script("setUpdateBtn('检查更新', false)");
                 }
-                UserEvent::UpdateProgress(pct) => {
-                    let _ = webview.evaluate_script(&format!("setUpdateProgress({})", pct));
+                UserEvent::UpdateProgress(p) => {
+                    // 注意：JS 函数名是 showUpdateProgress（app.js），
+                    // 且主页面跳到 dsh 界面后该函数不存在，需做存在性判断。
+                    let _ = webview.evaluate_script(&format!(
+                        "if (typeof showUpdateProgress === 'function') showUpdateProgress({});",
+                        p
+                    ));
                 }
                 UserEvent::UpdateDone(tag) => {
                     if tag.is_empty() {
@@ -371,13 +407,39 @@ fn main() {
                         { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast("已是最新版本"))); }
                         #[cfg(not(target_os = "macos"))]
                         let _ = webview.evaluate_script("showUpdateToast('已是最新版本')");
-                    } else {
+                    } else if at_dsh_web {
+                        // dsh 界面：没有完成对话框可显示，用原生 toast 提示重启。
+                        #[cfg(target_os = "macos")]
+                        {
+                            let t = format!("已升级到 {}，重启应用后生效", tag);
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast(&t)));
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         let _ = webview.evaluate_script(&format!(
-                            "showUpdateComplete({})",
+                            "if (typeof showUpdateToast === 'function') showUpdateToast('已升级到 {}，重启应用后生效')",
+                            tag
+                        ));
+                    } else {
+                        // 启动页：显示完成对话框（含"立即重启"按钮）。
+                        let _ = webview.evaluate_script(&format!(
+                            "if (typeof showUpdateComplete === 'function') showUpdateComplete({})",
                             ui::js_string_arg(&tag),
                         ));
                         let _ = webview.evaluate_script("setUpdateBtn('重启更新', false)");
                     }
+                }
+                UserEvent::UpdateFailed(msg) => {
+                    // 失败提示：优先原生 toast；启动页同时收起进度条。
+                    #[cfg(target_os = "macos")]
+                    { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast(&msg))); }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = webview.evaluate_script(&format!(
+                        "if (typeof showUpdateToast === 'function') showUpdateToast({})",
+                        ui::js_string_arg(&msg)
+                    ));
+                    let _ = webview.evaluate_script(
+                        "if (typeof hideUpdateProgress === 'function') hideUpdateProgress();",
+                    );
                 }
                 UserEvent::ShowHelp => {
                     if let Some((hw, _)) = &help_window {

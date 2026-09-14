@@ -327,13 +327,69 @@
     // We keep it for status bar updates if needed.
   }
 
+  // GitHub Release 的正文是 markdown：这里做一个覆盖常用语法的轻量渲染
+  // （标题/列表/粗体/行内代码/链接/引用/分隔线），避免把 ## 和 ** 当
+  // 纯文本显示。全部使用内联样式，与对话框整体风格保持一致。
+  function mdInline(s) {
+    s = escHtml(s);
+    return s
+      // `code` 行内代码
+      .replace(/`([^`]+)`/g, function (_, c) {
+        return '<code style="background:#252c3b;padding:1px 5px;border-radius:4px;font-family:SF Mono,Menlo,Consolas,monospace;font-size:12px;color:#c9d4e5;">' + c + '</code>';
+      })
+      // **bold**
+      .replace(/\*\*([^*]+)\*\*/g, '<b style="color:#c9d4e5;">$1</b>')
+      // [text](url) 链接（仅 http/https）
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, function (_, t, u) {
+        return '<a href="' + u + '" target="_blank" style="color:#4f8cff;text-decoration:none;">' + t + '</a>';
+      })
+      // 裸链接（前面是空白或行首；href 里的 URL 前是引号，不会被二次匹配）
+      .replace(/(^|[\s(])(https?:\/\/[^\s<)">]+)/g, function (_, pre, u) {
+        return pre + '<a href="' + u + '" target="_blank" style="color:#4f8cff;text-decoration:none;">' + u + '</a>';
+      });
+  }
+
+  function mdToHtml(md) {
+    if (!md) return '';
+    var lines = String(md).split(/\r?\n/);
+    var out = [];
+    var inList = false;
+    function closeList() { if (inList) { out.push('</ul>'); inList = false; } }
+    for (var i = 0; i < lines.length; i++) {
+      var t = lines[i].trim();
+      if (!t) { closeList(); continue; }
+      var m;
+      if ((m = t.match(/^#{1,6}\s+(.+)$/))) {
+        // # 标题：统一按小节标题样式渲染
+        closeList();
+        out.push('<div style="font-weight:600;color:#c9d4e5;margin:10px 0 4px;">' + mdInline(m[1]) + '</div>');
+      } else if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) {
+        closeList();
+        out.push('<hr style="border:none;border-top:1px solid #2a3242;margin:10px 0;">');
+      } else if ((m = t.match(/^[-*+]\s+(.+)$/)) || (m = t.match(/^\d+[.)]\s+(.+)$/))) {
+        // 无序/有序列表项：统一渲染为圆点列表
+        if (!inList) { out.push('<ul style="margin:6px 0;padding-left:18px;">'); inList = true; }
+        out.push('<li style="margin:3px 0;">' + mdInline(m[1]) + '</li>');
+      } else if ((m = t.match(/^>\s?(.+)$/))) {
+        // > 引用
+        closeList();
+        out.push('<div style="border-left:3px solid #3a4252;padding-left:10px;margin:6px 0;color:#8b93a3;">' + mdInline(m[1]) + '</div>');
+      } else {
+        closeList();
+        out.push('<p style="margin:6px 0;">' + mdInline(t) + '</p>');
+      }
+    }
+    closeList();
+    return out.join('');
+  }
+
   function showUpdateDialog(tag, notes) {
     var overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:100;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
     var box = document.createElement('div');
     box.style.cssText = 'background:#1a1f2e;border:1px solid #2a3242;border-radius:12px;padding:24px;max-width:420px;width:90%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#e6e6e6;';
     box.innerHTML = '<div style="font-size:16px;font-weight:600;margin-bottom:12px;">发现新版本 ' + escHtml(tag) + '</div>'
-      + (notes ? '<div style="font-size:13px;color:#8b93a3;max-height:180px;overflow:auto;margin-bottom:16px;white-space:pre-wrap;line-height:1.6;">' + escHtml(notes) + '</div>' : '')
+      + (notes ? '<div style="font-size:13px;color:#8b93a3;max-height:220px;overflow:auto;margin-bottom:16px;line-height:1.6;">' + mdToHtml(notes) + '</div>' : '')
       + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
       + '<button id="updCancel" style="padding:6px 16px;border-radius:6px;border:1px solid #3a4252;background:transparent;color:#8b93a3;cursor:pointer;font:13px -apple-system,sans-serif;">稍后</button>'
       + '<button id="updApply" style="padding:6px 16px;border-radius:6px;border:none;background:#4f8cff;color:#fff;cursor:pointer;font:13px -apple-system,sans-serif;">立即更新</button>'
@@ -369,6 +425,11 @@
       document.getElementById('updProgBar').style.width = pct + '%';
       document.getElementById('updProgPct').textContent = pct + '%';
     }
+  }
+
+  function hideUpdateProgress() {
+    var el = document.getElementById('updProgress');
+    if (el) el.remove();
   }
 
   function showUpdateComplete(tag) {

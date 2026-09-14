@@ -152,10 +152,67 @@ fn json_string_field(body: &str, key: &str) -> Option<String> {
     let colon = rest.find(':')?;
     let rest = rest[colon + 1..].trim_start();
     let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    // 还原 GitHub 可能输出的最小转义集合
-    // （tag 名称都是纯文本，但稳妥起见处理一下）。
-    Some(rest[..end].replace("\\/", "/"))
+    // 找到未被反斜杠转义的收尾引号：值里可能有 \"（转义引号）或
+    // \\（转义反斜杠），不能简单取第一个 '"'。
+    let bytes = rest.as_bytes();
+    let mut end = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // 连同被转义的字符一起跳过
+            continue;
+        }
+        if bytes[i] == b'"' {
+            end = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let end = end?;
+    // 反转义 JSON 转义序列（\n、\t、\uXXXX 等），还原真实文本。
+    Some(unescape_json_string(&rest[..end]))
+}
+
+/// 还原 JSON 字符串字面量中的转义序列。
+/// GitHub API 返回的 release notes 里换行是字面的 `\n`，
+/// 不还原的话更新日志会挤成一行并显示反斜杠字符。
+fn unescape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('u') => {
+                // \uXXXX：取 4 位十六进制拼成字符；格式异常时原样保留。
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            // 未知转义：原样保留，宁可多显示也不要吞内容。
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// 把类 semver 的 `X.Y.Z`（忽略额外后缀）解析成可比较的三元组。
@@ -205,11 +262,13 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
     let cache = match crate::environment::cache_dir() {
         Ok(c) => c,
         Err(e) => {
+            let _ = proxy.send_event(UserEvent::UpdateFailed("无法定位缓存目录".into()));
             let _ = proxy.send_event(UserEvent::Term(format!("  ✗ 升级失败：{}\r\n", e)));
             return;
         }
     };
     if let Err(e) = fs::create_dir_all(&cache) {
+        let _ = proxy.send_event(UserEvent::UpdateFailed("无法创建缓存目录".into()));
         let _ = proxy.send_event(UserEvent::Term(format!(
             "  ✗ 升级失败：无法创建缓存目录 {}: {}\r\n",
             cache.display(),
@@ -227,11 +286,23 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
     )));
     let total = http_content_length(&url).unwrap_or(0);
     let mut dl = match Command::new("curl")
-        .args(["-fsSL", "--max-time", "600", &url, "-o", &pkg.to_string_lossy()])
+        .args([
+            "-fsSL",
+            // 连接超时：GitHub 直连在部分网络环境下不可达，
+            // 20 秒内连不上就快速失败给出提示，避免长时间"无动静"。
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "600",
+            &url,
+            "-o",
+            &pkg.to_string_lossy(),
+        ])
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
+            let _ = proxy.send_event(UserEvent::UpdateFailed("无法启动下载".into()));
             let _ = proxy.send_event(UserEvent::Term(format!("  ✗ 下载失败：{}\r\n", e)));
             return;
         }
@@ -253,6 +324,10 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
                     "  升级包下载中…\r".to_string()
                 };
                 let _ = proxy.send_event(UserEvent::Term(line));
+                // 同步驱动更新进度条 UI（顶部横条 / 状态提示）。
+                if pct >= 0 {
+                    let _ = proxy.send_event(UserEvent::UpdateProgress(pct.clamp(0, 99) as u8));
+                }
             }
         }
         if dl.try_wait().ok().flatten().is_some() {
@@ -263,24 +338,36 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
     let ok = dl.wait().ok().map(|s| s.success()) == Some(true) && pkg.is_file();
     if !ok {
         let _ = fs::remove_file(&pkg);
+        let _ = proxy.send_event(UserEvent::UpdateFailed("下载失败，已跳过本次升级".into()));
         let _ = proxy.send_event(UserEvent::Term(format!(
             "  ✗ 升级包下载失败（{}）。本次跳过升级，不影响使用。\r\n",
             url
         )));
         return;
     }
+    let _ = proxy.send_event(UserEvent::UpdateProgress(100));
     let _ = proxy.send_event(UserEvent::Term("\r\n".into()));
     let _ = proxy.send_event(UserEvent::Term("  ✓ 下载完成，正在验证签名…\r\n".into()));
 
     // --- 验证签名 ---------------------------------------------------------
     let sig_downloaded = Command::new("curl")
-        .args(["-fsSL", "--max-time", "30", &sig_url, "-o", &sig_pkg.to_string_lossy()])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "30",
+            &sig_url,
+            "-o",
+            &sig_pkg.to_string_lossy(),
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
     if !sig_downloaded || !sig_pkg.is_file() {
         let _ = fs::remove_file(&pkg);
+        let _ = proxy.send_event(UserEvent::UpdateFailed("签名文件下载失败".into()));
         let _ = proxy.send_event(UserEvent::Term(
             "  ✗ 签名文件下载失败，无法验证更新包完整性。\r\n".into(),
         ));
@@ -296,6 +383,7 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
         Err(e) => {
             let _ = fs::remove_file(&pkg);
             let _ = fs::remove_file(&sig_pkg);
+            let _ = proxy.send_event(UserEvent::UpdateFailed("无法读取签名文件".into()));
             let _ = proxy.send_event(UserEvent::Term(format!(
                 "  ✗ 无法读取签名文件: {}\r\n", e
             )));
@@ -314,6 +402,7 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
             // 验签失败：删除已下载的包，拒绝安装
             let _ = fs::remove_file(&pkg);
             let _ = fs::remove_file(&sig_pkg);
+            let _ = proxy.send_event(UserEvent::UpdateFailed("签名验证失败".into()));
             let _ = proxy.send_event(UserEvent::Term(format!(
                 "  ✗ 签名验证失败: {}\r\n", e
             )));
@@ -350,8 +439,11 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
                 "已升级到 v{}，重启应用后生效",
                 ver
             )));
+            // 驱动"更新完成"UI（完成对话框 / 原生 toast + 重启按钮）。
+            let _ = proxy.send_event(UserEvent::UpdateDone(tag.to_string()));
         }
         Err(msg) => {
+            let _ = proxy.send_event(UserEvent::UpdateFailed("升级失败，已跳过".into()));
             let _ = proxy.send_event(UserEvent::Term(format!("  ✗ 升级失败：{}\r\n", msg)));
         }
     }
@@ -569,6 +661,24 @@ mod tests {
         let body = r#"{"url":"https:\/\/api.github.com\/x","tag_name":"v0.2.0","name":"v0.2.0"}"#;
         assert_eq!(json_string_field(body, "tag_name").as_deref(), Some("v0.2.0"));
         assert_eq!(json_string_field(body, "missing"), None);
+    }
+
+    #[test]
+    fn unescapes_release_notes() {
+        // GitHub API 返回的 body：换行是 \n，双引号是 \"，反斜杠是 \\。
+        // 注意：body 值以 "## 开头（含 "# 与 "## 序列），需要用三个 # 作原始字符串定界。
+        let body = r###"{"tag_name":"v0.2.0","body":"## 更新内容\n\n- 修复 \"进度条\" 不动的问题\n- 路径 C:\\Users"}"###;
+        let notes = json_string_field(body, "body").unwrap();
+        assert_eq!(notes, "## 更新内容\n\n- 修复 \"进度条\" 不动的问题\n- 路径 C:\\Users");
+    }
+
+    #[test]
+    fn unescapes_unicode_sequences() {
+        assert_eq!(unescape_json_string("a\\u4e2db"), "a中b");
+        // 格式异常的 \u 原样保留，不 panic。
+        assert_eq!(unescape_json_string("\\uZZZZ"), "\\uZZZZ");
+        // 行尾孤立的反斜杠不丢字符。
+        assert_eq!(unescape_json_string("x\\"), "x\\");
     }
 
     #[test]

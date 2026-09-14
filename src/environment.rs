@@ -270,19 +270,25 @@ fn download_and_extract_node(
 }
 
 /// 对 URL 发 HEAD 请求，返回 Content-Length（如果服务端提供）。
+///
+/// 必须带 `-L` 跟随重定向：GitHub Releases 的下载地址会 302 跳转到
+/// `objects.githubusercontent.com`，真正的文件大小在最后一跳的响应头里
+/// （取最后一个 content-length，忽略中间 302 响应的头）。
 pub(crate) fn http_content_length(url: &str) -> Option<u64> {
     let out = Command::new("curl")
-        .args(["-sI", "--max-time", "20", url])
+        .args(["-sIL", "--max-time", "20", url])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut len: Option<u64> = None;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("content-length:") {
-            return rest.trim().parse::<u64>().ok();
+            // 持续覆盖：重定向链中最后一跳的头才是最终文件的大小。
+            len = rest.trim().parse::<u64>().ok();
         }
     }
-    None
+    len
 }
 
 /// `@deepseek-ai/dsh` 运行时所需的最低 Node.js 版本。
