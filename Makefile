@@ -24,8 +24,8 @@ GIT_REMOTE     := origin
 GIT_BRANCH     := $(shell git branch --show-current)
 REPO_URL       := https://github.com/ht-shaipe/dsh-desktop
 
-# 计算下一版本（自动 bump patch）
-NEXT_PATCH := $(shell echo $(CURRENT_VERSION) | awk -F. '{print $$1"."$$2"."$$3+1}')
+# 计算下一版本（自动 bump patch，跳过已存在的标签）
+NEXT_PATCH := $(shell v=$(shell echo $(CURRENT_VERSION) | awk -F. '{print $$1"."$$2"."$$3+1}'); while git tag -l "v$$v" | grep -q .; do v=$(echo $$v | awk -F. '{print $$1"."$$2"."$$3+1}'); done; echo $$v)
 
 # 如果指定了 VERSION 则使用指定版本，否则自动 bump
 RELEASE_VERSION := $(if $(VERSION),$(VERSION),$(NEXT_PATCH))
