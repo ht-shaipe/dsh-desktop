@@ -311,9 +311,6 @@
     termLog('=== 启动 DeepSeek dsh Web ===');
     termLog('环境自检与启动状态将实时显示如下；命令运行输出也会在此呈现。');
     var c = document.getElementById('cmd');
-    // Enter sends the line to the running command. (Paste via ⌘V / Ctrl+V is
-    // handled natively by the OS once the app installs a proper Edit menu — see
-    // setup_macos_app_menu in main.rs — so we don't intercept it here.)
     c.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
         var v = c.value; c.value = '';
@@ -322,4 +319,104 @@
       }
     });
     c.focus();
+  }
+
+  // ==================== Update UI ====================
+  function setUpdateBtn(text, disabled) {
+    // This is called from Rust but the title bar is native NSButton.
+    // We keep it for status bar updates if needed.
+  }
+
+  function showUpdateDialog(tag, notes) {
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:100;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+    var box = document.createElement('div');
+    box.style.cssText = 'background:#1a1f2e;border:1px solid #2a3242;border-radius:12px;padding:24px;max-width:420px;width:90%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#e6e6e6;';
+    box.innerHTML = '<div style="font-size:16px;font-weight:600;margin-bottom:12px;">发现新版本 ' + escHtml(tag) + '</div>'
+      + (notes ? '<div style="font-size:13px;color:#8b93a3;max-height:180px;overflow:auto;margin-bottom:16px;white-space:pre-wrap;line-height:1.6;">' + escHtml(notes) + '</div>' : '')
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+      + '<button id="updCancel" style="padding:6px 16px;border-radius:6px;border:1px solid #3a4252;background:transparent;color:#8b93a3;cursor:pointer;font:13px -apple-system,sans-serif;">稍后</button>'
+      + '<button id="updApply" style="padding:6px 16px;border-radius:6px;border:none;background:#4f8cff;color:#fff;cursor:pointer;font:13px -apple-system,sans-serif;">立即更新</button>'
+      + '</div>';
+    overlay.appendChild(box);
+    (document.body || document.documentElement).appendChild(overlay);
+    document.getElementById('updCancel').onclick = function () { overlay.remove(); };
+    document.getElementById('updApply').onclick = function () {
+      overlay.remove();
+      showUpdateProgress(0);
+      window.ipc.postMessage('APPLY_UPDATE:' + tag);
+    };
+  }
+
+  function showUpdateProgress(pct) {
+    var el = document.getElementById('updProgress');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'updProgress';
+      el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100;background:#1a1f2e;border-bottom:1px solid #2a3242;padding:12px 20px;display:flex;align-items:center;gap:12px;font:13px -apple-system,sans-serif;color:#e6e6e6;';
+      el.innerHTML = '<span id="updProgText">正在下载更新…</span>'
+        + '<div style="flex:1;height:6px;background:#2a3242;border-radius:3px;overflow:hidden;">'
+        + '<div id="updProgBar" style="height:100%;width:0%;background:linear-gradient(90deg,#4f8cff,#7ee0a0);transition:width .2s;"></div></div>'
+        + '<span id="updProgPct" style="min-width:36px;text-align:right;">0%</span>';
+      (document.body || document.documentElement).appendChild(el);
+    }
+    el.style.display = 'flex';
+    if (pct >= 100) {
+      document.getElementById('updProgText').textContent = '正在安装…';
+      document.getElementById('updProgBar').style.width = '100%';
+      document.getElementById('updProgPct').textContent = '100%';
+    } else {
+      document.getElementById('updProgBar').style.width = pct + '%';
+      document.getElementById('updProgPct').textContent = pct + '%';
+    }
+  }
+
+  function showUpdateComplete(tag) {
+    var el = document.getElementById('updProgress');
+    if (el) el.remove();
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:100;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+    var box = document.createElement('div');
+    box.style.cssText = 'background:#1a1f2e;border:1px solid #2a3242;border-radius:12px;padding:24px;max-width:380px;width:90%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#e6e6e6;text-align:center;';
+    box.innerHTML = '<div style="font-size:16px;font-weight:600;margin-bottom:8px;">更新已完成</div>'
+      + '<div style="font-size:13px;color:#8b93a3;margin-bottom:16px;">' + escHtml(tag) + ' 已下载并安装，重启后生效。</div>'
+      + '<div style="display:flex;gap:8px;justify-content:center;">'
+      + '<button id="updLater" style="padding:6px 16px;border-radius:6px;border:1px solid #3a4252;background:transparent;color:#8b93a3;cursor:pointer;font:13px -apple-system,sans-serif;">稍后重启</button>'
+      + '<button id="updRestart" style="padding:6px 16px;border-radius:6px;border:none;background:#4f8cff;color:#fff;cursor:pointer;font:13px -apple-system,sans-serif;">立即重启</button>'
+      + '</div>';
+    overlay.appendChild(box);
+    (document.body || document.documentElement).appendChild(overlay);
+    document.getElementById('updLater').onclick = function () { overlay.remove(); };
+    document.getElementById('updRestart').onclick = function () {
+      window.ipc.postMessage('RESTART_APP');
+    };
+  }
+
+  function showUpdateToast(msg) {
+    var toast = document.createElement('div');
+    toast.style.cssText = 'position:fixed;top:12px;right:12px;z-index:100;background:#1a2332;border:1px solid #2a3242;color:#7ee0a0;border-radius:8px;padding:8px 16px;font:13px -apple-system,sans-serif;animation:fadeIn .2s;';
+    toast.textContent = msg;
+    (document.body || document.documentElement).appendChild(toast);
+    setTimeout(function () { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; }, 2000);
+    setTimeout(function () { toast.remove(); }, 2500);
+  }
+
+  function showAboutDialog() {
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:100;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+    var box = document.createElement('div');
+    box.style.cssText = 'background:#1a1f2e;border:1px solid #2a3242;border-radius:12px;padding:28px;max-width:360px;width:90%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#e6e6e6;text-align:center;';
+    box.innerHTML = '<div style="font-size:18px;font-weight:600;margin-bottom:8px;">DeepSeek dsh Desktop</div>'
+      + '<div style="font-size:13px;color:#8b93a3;margin-bottom:4px;">版本 ' + (typeof dshVersion !== 'undefined' ? dshVersion : 'unknown') + '</div>'
+      + '<div style="font-size:13px;color:#8b93a3;margin-bottom:16px;">基于 DeepSeek dsh Web 构建</div>'
+      + '<div style="margin-bottom:16px;"><a href="#" id="aboutGH" style="color:#4f8cff;text-decoration:none;font-size:13px;">github.com/ht-shaipe/dsh-desktop</a></div>'
+      + '<button id="aboutOk" style="padding:6px 24px;border-radius:6px;border:none;background:#4f8cff;color:#fff;cursor:pointer;font:13px -apple-system,sans-serif;">好</button>';
+    overlay.appendChild(box);
+    (document.body || document.documentElement).appendChild(overlay);
+    document.getElementById('aboutOk').onclick = function () { overlay.remove(); };
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) overlay.remove(); });
+    document.getElementById('aboutGH').addEventListener('click', function (e) {
+      e.preventDefault();
+      window.open('https://github.com/ht-shaipe/dsh-desktop', '_blank');
+    });
   }

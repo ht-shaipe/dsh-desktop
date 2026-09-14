@@ -1,9 +1,9 @@
-//! Launches `npx -y @deepseek-ai/dsh web` and streams its output to the UI.
+//! 启动 `npx -y @deepseek-ai/dsh web` 并把输出流式推送到 UI。
 //!
-//! On Unix we run the command inside a PTY (`forkpty`) so it behaves like a real
-//! terminal and can accept interactive input; on Windows we fall back to pipes.
-//! The output is decoded carefully (UTF-8 split across reads is reassembled) and
-//! any `(y/N)`-style confirmation prompt is detected and auto-answered once.
+//! Unix 上我们把命令放进 PTY（`forkpty`）里运行，使其表现得像真实
+//! 终端一样、可接受交互输入；Windows 上回退为管道。输出会经过谨慎的
+//! 解码（跨读取块被拆开的 UTF-8 会重新拼合），并且任何 `(y/N)` 形式的
+//! 确认提示都会被检测到并自动回答一次。
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -24,8 +24,8 @@ use tao::event_loop::EventLoopProxy;
 
 use crate::{ARGS, POLL_ADDR, TARGET_URL, InputSink, ServerHandle, UserEvent};
 
-/// Append-only debug log used to diagnose startup/auth issues; safe to call
-/// from any thread, never panics. Located in /tmp so users can share it.
+/// 追加式调试日志，用于排查启动/认证问题；任何线程都能安全调用，
+/// 且绝不 panic。放在 /tmp 下方便用户分享。
 pub fn dbg_log(msg: &str) {
     use std::io::Write as _;
     let ts = std::time::SystemTime::now()
@@ -41,7 +41,7 @@ pub fn dbg_log(msg: &str) {
     }
 }
 
-/// Wraps a raw file descriptor so we can write user keystrokes into the PTY.
+/// 包装裸文件描述符，使我们可以把用户的按键写入 PTY。
 #[cfg(unix)]
 struct FdWriter(RawFd);
 #[cfg(unix)]
@@ -59,8 +59,8 @@ impl Write for FdWriter {
     }
 }
 
-/// Launch `npx -y @deepseek-ai/dsh web` inside the in-app interactive
-/// terminal, stream its output back to the UI, and wait for `127.0.0.1:3080`.
+/// 在应用内交互式终端中启动 `npx -y @deepseek-ai/dsh web`，
+/// 把输出流式回传给 UI，并等待 `127.0.0.1:3080` 就绪。
 pub fn launch_terminal(
     npx: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
@@ -71,32 +71,30 @@ pub fn launch_terminal(
 ) {
     let cmd = format!("{} {}", npx.display(), ARGS.join(" "));
     dbg_log(&format!("LAUNCH: {}", cmd));
-    // Activity timestamp shared with the reader + server poller. Used to show a
-    // "still working" heartbeat while npm downloads dependencies silently
-    // (CI + non-TTY mode suppresses its progress output).
+    // 与读取线程、服务轮询线程共享的"最近活动"时间戳。npm 静默下载
+    // 依赖期间（CI/非 TTY 模式会抑制其进度输出），用它来展示
+    // "仍在工作中"的心跳提示。
     let last_term = Arc::new(Mutex::new(Instant::now()));
-    // The authenticated URL printed by `dsh web` (e.g.
-    // `dsh web: http://127.0.0.1:3080?token=…`). Parsed from the child's
-    // stdout by the reader thread and consumed by `wait_for_server` so the
-    // webview navigates to the token-bearing URL instead of the bare port
-    // (which would render a blank page — the server rejects unauthenticated
-    // requests).
+    // 由 `dsh web` 打印出来的带认证的 URL（例如
+    // `dsh web: http://127.0.0.1:3080?token=…`）。读取线程从子进程
+    // stdout 中解析它，`wait_for_server` 消费它 —— 让 webview 跳转到
+    // 带 token 的 URL，而不是裸端口（裸端口会渲染空白页 ——
+    // 服务器会拒绝未认证的请求）。
     let server_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    // The environment flow already switched the view to the interactive terminal
-    // and logged the "准备启动" phase, so here we just make sure the view is up
-    // (idempotent) and echo the command being run.
+    // 环境自检流程已经把视图切到交互式终端并打印了"准备启动"阶段，
+    // 这里只做幂等确认，并回显将要执行的命令。
     let _ = proxy.send_event(UserEvent::EnterTerminal);
 
-    // Make sure the server port is free. A stale `dsh web` left over from a
-    // previous launch that wasn't cleaned up (e.g. the app was force-quit)
-    // would hold 127.0.0.1:3080 and make the new command fail to bind — which
-    // previously surfaced only as a confusing 5-minute timeout.
+    // 确保服务端口空闲。上一次启动遗留的 `dsh web`（例如应用被强杀
+    // 而没来得及清理）会占着 127.0.0.1:3080，导致新命令绑定失败 ——
+    // 以前这只会表现为一个莫名其妙的 5 分钟超时。
     #[cfg(unix)]
     if ensure_port_free(&proxy).is_err() {
         return;
     }
 
+    // Unix 走 PTY，Windows 走管道
     #[cfg(unix)]
     let started = start_command_pty(
         &npx,
@@ -123,7 +121,7 @@ pub fn launch_terminal(
     match started {
         Ok(()) => {
             let _ = proxy.send_event(UserEvent::EnterTerminal);
-            // Echo the command being run so the terminal reads like a real shell.
+            // 回显将要执行的命令，让终端读起来像真实的 shell。
             *last_term.lock().unwrap() = Instant::now();
             let _ = proxy.send_event(UserEvent::Term(format!("\r\n$ {}\r\n", cmd)));
             wait_for_server(proxy, handle, exited, last_term, server_url);
@@ -134,18 +132,18 @@ pub fn launch_terminal(
     }
 }
 
-/// Make sure nothing is already listening on the server port. A stale
-/// `dsh web` from a previous launch that wasn't cleaned up (e.g. the app was
-/// force-quit) would hold 127.0.0.1:3080, causing the new command to fail to
-/// bind. We try to free it automatically — only killing the listener, and only
-/// if it looks like a node/dsh process we likely own — else we surface a clear,
-/// actionable error instead of a confusing timeout.
+/// 确保没有其他进程正在监听服务端口。上次启动遗留的 `dsh web`
+/// （例如应用被强杀而没清理）会占着 127.0.0.1:3080，导致新命令
+/// 绑定失败。我们会尝试自动释放端口 —— 只杀监听进程，且只在它
+/// 看起来是我们自己的 node/dsh 进程时才动手；否则给出清晰、
+/// 可操作的错误提示，而不是让用户面对一个莫名其妙的超时。
 #[cfg(unix)]
 fn ensure_port_free(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
     if std::net::TcpStream::connect(POLL_ADDR).is_err() {
-        return Ok(()); // port is free
+        return Ok(()); // 端口空闲
     }
     let _ = proxy.send_event(UserEvent::Stage("端口 3080 被占用，正在清理残留进程…".into()));
+    // 找出监听 3080 的进程
     let out = Command::new("lsof")
         .args(["-tiTCP:3080", "-sTCP:LISTEN"])
         .output();
@@ -154,6 +152,7 @@ fn ensure_port_free(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
         let mut killed = false;
         for line in pids.lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
+                // 查看进程命令行，确认是 dsh/node 进程才杀
                 let cmd = Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "command="])
                     .output();
@@ -167,6 +166,7 @@ fn ensure_port_free(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
             }
         }
         if killed {
+            // 给内核一点时间释放端口，再复查一次
             thread::sleep(Duration::from_millis(1000));
             if std::net::TcpStream::connect(POLL_ADDR).is_err() {
                 return Ok(());
@@ -184,8 +184,8 @@ fn ensure_port_free(_proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
     Ok(())
 }
 
-/// Poll the server port (no hard timeout) until it's up, the process exits, or
-/// a generous limit passes — the user can watch/respond in the terminal.
+/// 轮询服务端口（无硬性超时），直到服务就绪、进程退出，或到达一个
+/// 比较宽裕的上限为止 —— 用户全程可以在终端里查看/响应。
 #[allow(unused_variables)]
 fn wait_for_server(
     proxy: EventLoopProxy<UserEvent>,
@@ -197,12 +197,13 @@ fn wait_for_server(
     let mut ready = false;
     let mut last_beat: Option<Instant> = None;
     for _ in 0..1200 {
-        // ~10 minutes, but the terminal stays live the whole time. Bumped from 5
-        // minutes because a slow first-time dependency download can legitimately
-        // take longer, and the in-app terminal now shows progress meanwhile.
+        // 约 10 分钟，但期间终端始终保持活跃。从原来的 5 分钟上调，
+        // 因为首次运行时依赖下载慢是正常的，且应用内终端现在能
+        // 同步展示进度。
         if exited.load(Ordering::SeqCst) {
             break;
         }
+        // Windows（管道模式）没有 PTY 的退出通知，这里主动轮询子进程状态
         #[cfg(windows)]
         {
             if let Some(h) = handle.lock().unwrap().as_mut() {
@@ -216,9 +217,8 @@ fn wait_for_server(
             break;
         }
 
-        // While npm downloads dependencies it produces no output. If we've been
-        // silent for a few seconds, reassure the user via the status bar instead
-        // of leaving the terminal looking frozen.
+        // npm 下载依赖时没有任何输出。如果已经静默了几秒，就在状态栏
+        // 安抚用户一下，而不是让终端看起来像卡死了。
         let silent = {
             let t = last_term.lock().unwrap();
             t.elapsed().as_millis() as u64
@@ -239,21 +239,19 @@ fn wait_for_server(
 
     if ready {
         dbg_log("PORT_READY");
-        // The port is up but the `dsh web: <url>` line may not have been
-        // read yet — wait for the reader thread to parse the authenticated
-        // URL before falling back to the bare port. NOTE: the lock guard must
-        // be dropped before entering the wait loop; re-locking inside
-        // `unwrap_or_else` on the same statement would deadlock (the temporary
-        // guard lives until the statement ends).
+        // 端口已通，但 `dsh web: <url>` 这一行可能还没被读到 —— 先等
+        // 读取线程解析出带认证的 URL，实在等不到才回退到裸端口。
+        // 注意：锁的 guard 必须在进入等待循环前释放；若在同一语句里
+        // 通过 `unwrap_or_else` 重新加锁会死锁（临时 guard 会活到
+        // 语句结束）。
         let mut parsed: Option<String> = server_url.lock().unwrap().clone();
         if parsed.is_none() {
             let _ = proxy.send_event(UserEvent::Status(
                 "服务端口已就绪，正在等待认证 URL…".into()
             ));
-            // The bare port is useless when the server requires a token (it
-            // renders an "authentication required" page), so wait generously —
-            // some dsh builds keep the port listening for a while before the
-            // token URL is printed.
+            // 服务器要求 token 时裸端口没用（只会渲染"需要认证"页面），
+            // 所以要宽裕地等待 —— 某些 dsh 版本会先监听端口，
+            // 过一会儿才打印 token URL。
             for i in 0..300 {
                 if exited.load(Ordering::SeqCst) {
                     break;
@@ -273,10 +271,9 @@ fn wait_for_server(
         }
         let url = parsed.unwrap_or_else(|| {
             dbg_log("GRACE_EXPIRED_NO_URL -> fallback bare URL + watcher");
-            // Last resort: open the bare URL (it may show an auth-required
-            // page) but keep watching for the authenticated URL in the
-            // background — as soon as it is parsed we re-navigate, which
-            // recovers the view without any user action.
+            // 最后手段：先打开裸 URL（可能显示"需要认证"页），
+            // 同时在后台继续监听带认证的 URL —— 一旦解析到就重新跳转，
+            // 无需用户任何操作即可恢复视图。
             spawn_late_url_watcher(proxy.clone(), server_url.clone(), exited.clone());
             let _ = proxy.send_event(UserEvent::Status(
                 "暂未获取到认证 URL，先用默认地址打开；解析到认证地址后会自动跳转…".into()
@@ -296,18 +293,17 @@ fn wait_for_server(
     }
 }
 
-/// Keep watching for the authenticated URL after the webview already opened
-/// the bare port (last-resort fallback). Some dsh builds print the token URL
-/// well after the port starts listening; when it finally shows up we
-/// re-navigate the webview so the user never has to copy the token manually.
+/// webview 已经打开裸端口（最后手段的回退）之后，继续在后台监听
+/// 带认证的 URL。某些 dsh 版本在端口开始监听后很久才打印 token URL；
+/// 一旦它出现，我们就让 webview 重新跳转，用户无需手动复制 token。
 fn spawn_late_url_watcher(
     proxy: EventLoopProxy<UserEvent>,
     server_url: Arc<Mutex<Option<String>>>,
     exited: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        // Watch for up to 10 minutes; the reader thread fills `server_url`
-        // whenever the token URL appears in the child's output.
+        // 最多监听 10 分钟；子进程输出中出现 token URL 时，
+        // 读取线程会填充 `server_url`。
         for _ in 0..1200 {
             if exited.load(Ordering::SeqCst) {
                 return;
@@ -325,10 +321,10 @@ fn spawn_late_url_watcher(
     });
 }
 
-/// Extract the authenticated server URL from one output line. Matches the
-/// canonical `dsh web: http://127.0.0.1:3080/?token=…` prefix, and — as a
-/// fallback for future output-format changes — any http(s) URL pointing at
-/// our port that carries a `token=` query parameter.
+/// 从一行输出中提取带认证的服务 URL。优先匹配规范的
+/// `dsh web: http://127.0.0.1:3080/?token=…` 前缀；作为对未来输出
+/// 格式变化的兜底，也匹配任何指向我们端口、且带 `token=` 查询参数
+/// 的 http(s) URL。
 fn parse_server_url(line: &str) -> Option<String> {
     if let Some(pos) = line.find("dsh web:") {
         let rest = &line[pos + "dsh web:".len()..];
@@ -338,6 +334,7 @@ fn parse_server_url(line: &str) -> Option<String> {
             }
         }
     }
+    // 兜底：扫描行内所有 http 开头的片段，找带 token 的本机端口 URL
     let mut idx = 0;
     while let Some(pos) = line[idx..].find("http") {
         let cand = &line[idx + pos..];
@@ -356,9 +353,9 @@ fn parse_server_url(line: &str) -> Option<String> {
     None
 }
 
-/// Heuristically detect that the command is prompting for a yes/no confirmation
-/// (e.g. npm's `(y/N)`, a `continue?` / `proceed?` question, …). Conservative on
-/// purpose: a false positive only sends an extra `y`, which is usually harmless.
+/// 启发式检测命令是否在等待 yes/no 确认（例如 npm 的 `(y/N)`、
+/// `continue?` / `proceed?` 之类的问题）。刻意保持保守：
+/// 误判最多只是多送一个 `y`，通常无害。
 fn detect_prompt(s: &str) -> bool {
     if s.contains("(y/N)")
         || s.contains("[Y/n]")
@@ -386,9 +383,10 @@ fn detect_prompt(s: &str) -> bool {
     false
 }
 
-/// Pull the actual question text out of recent output so the UI can show the
-/// user exactly what they're being asked, instead of a generic notice.
+/// 从最近的输出中提取出真正的问题文本，让 UI 能把"在问什么"
+/// 原样展示给用户，而不是一句泛泛的提示。
 fn extract_prompt_text(recent: &str) -> String {
+    // 取最近的最多 4 个非空行（从后往前数，再恢复原顺序）
     let lines: Vec<&str> = recent.lines().collect();
     let mut m: Vec<&str> = lines
         .iter()
@@ -406,10 +404,9 @@ fn extract_prompt_text(recent: &str) -> String {
     }
 }
 
-/// Strip ANSI escape sequences (CSI + OSC) and other control characters so we
-/// can run prompt detection and surface clean question text. The full ANSI
-/// output is still forwarded to the UI for colored rendering; this is only for
-/// our own (invisible) bookkeeping.
+/// 去除 ANSI 转义序列（CSI + OSC）及其他控制字符，便于做提示检测、
+/// 展示干净的问题文本。完整的 ANSI 输出仍会转发给 UI 做彩色渲染；
+/// 这里的处理只服务于我们自己的（不可见的）记录。
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -417,8 +414,8 @@ fn strip_ansi(s: &str) -> String {
         if c == '\u{1b}' {
             match it.peek() {
                 Some(&'[') => {
-                    it.next(); // consume '['
-                    // skip until the final CSI byte (0x40..=0x7e)
+                    it.next(); // 消费 '['
+                    // 跳到 CSI 序列的结束字节（0x40..=0x7e）
                     for n in it.by_ref() {
                         if ('\u{40}'..='\u{7e}').contains(&n) {
                             break;
@@ -426,8 +423,8 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 Some(&']') => {
-                    it.next(); // consume ']'
-                    // OSC: until BEL or ST (ESC \)
+                    it.next(); // 消费 ']'
+                    // OSC 序列：直到 BEL 或 ST（ESC \）为止
                     for n in it.by_ref() {
                         if n == '\u{07}' {
                             break;
@@ -441,11 +438,12 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 _ => {
-                    it.next(); // skip one char after a stray ESC
+                    it.next(); // 跳过零散 ESC 后的一个字符
                 }
             }
             continue;
         }
+        // 保留换行/回车/制表符，其余控制字符丢弃
         if c == '\n' || c == '\r' || c == '\t' {
             out.push(c);
         } else if (c as u32) >= 0x20 {
@@ -469,10 +467,12 @@ fn start_command_pty(
     use std::ptr;
     use std::os::unix::ffi::OsStrExt as _;
 
+    // 字节串 -> CString（内部含 NUL 的参数会报错）
     let cz = |b: &[u8]| -> io::Result<CString> {
         CString::new(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
     };
 
+    // 组装 argv: [npx, args..., NULL]
     let cpath = cz(npx.as_os_str().as_bytes())?;
     let mut cstrings: Vec<CString> = vec![cpath];
     let mut argv: Vec<*const libc::c_char> = vec![cstrings[0].as_ptr()];
@@ -483,6 +483,7 @@ fn start_command_pty(
     }
     argv.push(ptr::null());
 
+    // 把 npx 所在目录前置到 PATH，保证子进程能找到同目录的 node 等工具
     let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let inherited = std::env::var("PATH").unwrap_or_default();
     let new_path = if npx_dir.is_empty() {
@@ -492,19 +493,19 @@ fn start_command_pty(
     };
     let node_opts = filter_node_options();
 
+    // 组装子进程环境变量
     let mut base: HashMap<String, String> = std::env::vars().collect();
     base.insert("PATH".into(), new_path);
     base.insert("NODE_OPTIONS".into(), node_opts);
     base.insert("npm_config_yes".into(), "true".into());
-    // Let the child behave like a real interactive terminal: emit ANSI colors and
-    // redraw progress bars via carriage returns. The in-app terminal renders
-    // these properly now (ANSI emulator in resources/app.js) instead of showing
-    // raw escape garbage.
+    // 让子进程表现得像真实的交互终端：输出 ANSI 颜色、用回车符重绘
+    // 进度条。应用内终端现在已经能正确渲染这些（resources/app.js
+    // 里的 ANSI 模拟器），而不是显示一堆原始转义乱码。
     base.insert("TERM".into(), "xterm-256color".into());
     base.insert("FORCE_COLOR".into(), "1".into());
-    // npm_config_progress left at its default (on for a TTY) so the download
-    // progress bar actually shows.
+    // npm_config_progress 保持默认（TTY 下开启），让下载进度条能显示。
 
+    // 组装 envp: ["K=V", ..., NULL]
     let mut env_strings: Vec<CString> = Vec::new();
     let mut envp: Vec<*const libc::c_char> = Vec::new();
     for (k, v) in &base {
@@ -516,6 +517,7 @@ fn start_command_pty(
 
     unsafe {
         let mut master: libc::c_int = -1;
+        // PTY 的初始窗口尺寸：30 行 x 120 列
         let mut ws = libc::winsize {
             ws_row: 30,
             ws_col: 120,
@@ -532,23 +534,23 @@ fn start_command_pty(
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
-            // Child: turn off terminal echo so auto-fed confirmations don't
-            // get printed back as confusing `y` lines in our terminal view.
+            // 子进程：关闭终端回显，避免自动喂进去的确认回答被回显成
+            // 一行让人困惑的 `y`。
             let mut term: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(0, &mut term) == 0 {
                 term.c_lflag &= !libc::ECHO;
-                libc::tcsetattr(0, libc::TCSANOW, &term);
+                libc::tcsetattr(0, libc::TCSANOW, &mut term);
             }
-            // Child: exec the command in the PTY.
+            // 子进程：在 PTY 中 exec 目标命令。
             libc::execve(cstrings[0].as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
 
-        // Parent.
+        // ---- 父进程 ----
         *handle.lock().unwrap() = Some(ServerHandle { pid });
         *input_writer.lock().unwrap() = Some(Box::new(FdWriter(master)));
 
-        // Stream output from the PTY master to the UI.
+        // 起一个线程：把 PTY master 的输出流式转发给 UI。
         let rmaster = master;
         let rproxy = proxy.clone();
         let rexit = exited.clone();
@@ -558,15 +560,15 @@ fn start_command_pty(
         let rurl = server_url.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            // Accumulate raw bytes so multi-byte UTF-8 chars that span two
-            // reads are not decoded mid-character (which produces garbage).
+            // 累积原始字节：跨两次读取被拆开的多字节 UTF-8 字符
+            // 不会在半截被解码（否则会出乱码）。
             let mut carry: Vec<u8> = Vec::with_capacity(1024);
-            // Accumulate incomplete lines (no newline yet) so a URL printed
-            // across two PTY reads is parsed as one piece, not two fragments.
-            let mut line_buf = String::new();
+            // 累积尚未换行的半截行：一个 URL 如果横跨两次 PTY 读取，
+            // 要拼成一段再解析，而不是当成两个碎片。
+            let mut line_buf: String = String::new();
             let mut last_auto: Option<Instant> = None;
-            // Rolling window of recent output lines — used to surface the
-            // *actual* question text when the command asks for confirmation.
+            // 最近输出的滚动窗口 —— 用于在命令请求确认时展示
+            // *真正的* 问题文本。
             let mut recent_lines: Vec<String> = Vec::new();
             loop {
                 let n = libc::read(rmaster, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
@@ -574,14 +576,14 @@ fn start_command_pty(
                     break;
                 }
                 carry.extend_from_slice(&buf[..n as usize]);
-                // Find the longest valid UTF-8 prefix.
+                // 找出最长的合法 UTF-8 前缀。
                 let valid = match std::str::from_utf8(&carry) {
                     Ok(_) => carry.len(),
                     Err(e) => e.valid_up_to(),
                 };
                 if valid == 0 && carry.len() >= 4 {
-                    // A lone multibyte char keeps spanning chunks; flush it to
-                    // avoid an unbounded stall.
+                    // 一个多字节字符一直跨块：直接冲掉，
+                    // 避免无限期卡住。
                     let s = String::from_utf8_lossy(&carry).into_owned();
                     carry.clear();
                     *rlast.lock().unwrap() = Instant::now();
@@ -592,42 +594,43 @@ fn start_command_pty(
                     let chunk = String::from_utf8_lossy(&carry[..valid]).into_owned();
                     carry.drain(..valid);
                     *rlast.lock().unwrap() = Instant::now();
-                    // Forward the raw (ANSI-containing) output so the in-app
-                    // terminal can render real colors / progress bars.
+                    // 转发原始（含 ANSI）输出，让应用内终端
+                    // 能渲染真正的颜色 / 进度条。
                     let _ = rproxy.send_event(UserEvent::Term(chunk.clone()));
-                    // Keep a small rolling window of *plain* (ANSI-stripped) output
-                    // so we can (a) detect prompts and (b) surface the literal
-                    // question text without escape codes.
+                    // 同时维护一小段*纯文本*（去掉 ANSI）滚动窗口，
+                    // 用于 (a) 检测确认提示 (b) 展示不含转义序列的
+                    // 问题原文。
                     let plain = strip_ansi(&chunk);
                     line_buf.push_str(&plain);
-                    // Split on '\r' OR '\n': some CLI output terminates lines
-                    // with a bare carriage return (progress redraws), and the
-                    // token URL must not stay trapped in an unterminated line.
+                    // 以 '\r' 或 '\n' 分行：有些 CLI 输出用裸回车符
+                    // 结束一行（进度条重绘），而 token URL 不能被困在
+                    // 一个永远不结束的行里。
                     while let Some(nl) =
                         line_buf.find(|c: char| c == '\n' || c == '\r')
                     {
                         let line = line_buf[..nl].to_string();
                         line_buf.drain(..=nl);
                         if line.trim().is_empty() {
-                            continue; // \r\n leaves an empty second line
+                            continue; // \r\n 会留下一个空的第二行
                         }
                         dbg_log(&format!("LINE: {}", line));
                         recent_lines.push(line.clone());
-                        // Parse the authenticated URL printed by
-                        // `dsh web: http://127.0.0.1:3080?token=…`
-                        // so the webview can navigate to it instead of the
-                        // bare port (which would show a blank page).
+                        // 解析 `dsh web: http://127.0.0.1:3080?token=…`
+                        // 打印出来的带认证 URL，让 webview 跳转到它，
+                        // 而不是裸端口（裸端口会是空白页）。
                         if let Some(url) = parse_server_url(&line) {
                             *rurl.lock().unwrap() = Some(url);
                         }
                     }
+                    // 窗口只保留最近 20 行
                     if recent_lines.len() > 20 {
                         recent_lines.drain(..recent_lines.len() - 20);
                     }
-                    // If the command is asking for a (y/N) confirmation, answer
-                    // it once and show the exact question it asked.
+                    // 命令在请求 (y/N) 确认时：自动回答一次，
+                    // 并把它问的原话展示出来。
                     if detect_prompt(&plain) {
                         let now = Instant::now();
+                        // 至少间隔 1.5s 才能再次自动回答，防止连续误触发
                         let can = match last_auto {
                             Some(t) => now.duration_since(t).as_millis() >= 1500,
                             None => true,
@@ -646,6 +649,7 @@ fn start_command_pty(
                     }
                 }
             }
+            // PTY 读到了 EOF：子进程已退出。
             dbg_log("READER_EXIT");
             rexit.store(true, Ordering::SeqCst);
             let _ = rproxy.send_event(UserEvent::TermDone("进程已退出".into()));
@@ -667,10 +671,12 @@ fn start_command_piped(
     _last_term: Arc<Mutex<Instant>>,
     server_url: Arc<Mutex<Option<String>>>,
 ) -> io::Result<()> {
+    // 把 npx 所在目录前置到 PATH（Windows 用分号分隔）
     let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let inherited = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{};{}", npx_dir, inherited);
 
+    // Windows 没有 forkpty，用管道方式启动
     let mut child = Command::new(npx)
         .args(ARGS)
         .env("PATH", new_path)
@@ -688,6 +694,7 @@ fn start_command_piped(
     *input_writer.lock().unwrap() = Some(Box::new(stdin));
     *handle.lock().unwrap() = Some(ServerHandle { child });
 
+    // stdout / stderr 各起一个读取线程
     spawn_reader(stdout, proxy.clone(), server_url.clone());
     spawn_reader(stderr, proxy.clone(), server_url);
     Ok(())
@@ -716,9 +723,9 @@ fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProx
     });
 }
 
-/// Strip options the bundled (older) Node doesn't understand — notably
-/// `--use-system-ca`, which some corporate/machine setups inject into
-/// NODE_OPTIONS and which Node 20 rejects.
+/// 过滤掉内置（较旧）Node 不认识的选项 —— 尤其是
+/// `--use-system-ca`：某些公司/机器环境会把它注入 NODE_OPTIONS，
+/// 而 Node 20 会直接拒绝该选项。
 fn filter_node_options() -> String {
     std::env::var("NODE_OPTIONS")
         .unwrap_or_default()
@@ -734,7 +741,7 @@ mod tests {
 
     #[test]
     fn parses_real_dsh_output() {
-        // Real captured line: spinner chars + ANSI-free plain text, \r\n split off.
+        // 真实抓取的输出行：转圈字符 + 无 ANSI 的纯文本，已去掉 \r\n。
         let line = "⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋dsh web: http://127.0.0.1:3080/?token=3I3a0EnMMRmHOqnVxOSLFhorURk-N8xCSYuvEvsikY0";
         assert_eq!(
             parse_server_url(line).unwrap(),

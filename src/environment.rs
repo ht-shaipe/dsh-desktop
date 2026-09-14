@@ -1,9 +1,9 @@
-//! Environment check + portable Node.js install.
+//! 环境自检 + 便携版 Node.js 自动安装。
 //!
-//! On launch we look for an `npx` on the machine (probing common locations,
-//! since a GUI `.app` gets a minimal `PATH`). If none is found we download a
-//! portable Node.js build into `~/.cache/dsh-desktop` — no admin rights needed
-//! — then hand off to the terminal launcher.
+//! 应用启动时会在本机查找可用的 `npx`（由于 GUI `.app` 拿到的 `PATH`
+//! 非常精简，所以需要主动探测常见安装位置）。如果没找到，就把一份
+//! 便携版 Node.js 下载到 `~/.cache/dsh-desktop` —— 无需管理员权限 ——
+//! 然后交给终端启动器继续执行。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,9 +18,8 @@ use tao::event_loop::EventLoopProxy;
 use crate::{InputSink, ServerHandle, UserEvent};
 use crate::terminal::launch_terminal;
 
-/// Full startup sequence: check the environment, list what's missing,
-/// auto-install Node.js if needed, then launch the server in an interactive
-/// terminal.
+/// 完整的启动流程：检查运行环境、列出缺失项、
+/// 必要时自动安装 Node.js，然后在交互式终端中启动服务。
 pub fn run_environment_flow(
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
@@ -28,21 +27,21 @@ pub fn run_environment_flow(
     user_took_over: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
 ) {
-    // Show the interactive terminal right away so the whole startup — env check,
-    // auto-install, and the command's own output — reads like one shell session.
+    // 立即切换到交互式终端视图，让整个启动过程 —— 环境自检、自动安装、
+    // 命令自身的输出 —— 读起来就像一次完整的 shell 会话。
     let _ = proxy.send_event(UserEvent::EnterTerminal);
     let _ = proxy.send_event(UserEvent::Term("=== 启动前环境自检 ===\r\n".into()));
     let _ = proxy.send_event(UserEvent::Status("正在检查运行环境…".into()));
 
-    // --- 0. Self-update check (non-fatal; offline machines just skip) -----
+    // --- 0. 应用自更新检查（非致命；离线机器直接跳过） -------------------
     crate::updater::check_and_apply(&proxy);
 
-    // --- 1. Environment check -------------------------------------------
+    // --- 1. 环境检查 ------------------------------------------------------
     let node = resolve_npx();
-    // Decide whether the found npx is usable. If its Node is too old (the
-    // `@deepseek-ai/dsh` package requires Node >= v22.15.0 at runtime — see
-    // MIN_NODE_MAJOR/MIN_NODE_MINOR for the exact APIs), we fall through to the
-    // portable-Node install instead of failing later.
+    // 判断找到的 npx 是否可用。如果它对应的 Node 版本过低
+    // （`@deepseek-ai/dsh` 运行时要求 Node >= v22.15.0，
+    // 详见 MIN_NODE_MAJOR/MIN_NODE_MINOR 处列出的具体 API），
+    // 则不再直接使用，转而走便携版 Node 安装流程，避免启动后才失败。
     let (usable_npx, node_line, install_reason): (Option<PathBuf>, String, String) = match &node {
         Some(p) => match npx_node_version(p) {
             Some(v) if node_meets_min(v) => (
@@ -93,14 +92,14 @@ pub fn run_environment_flow(
         "• @deepseek-ai/dsh 命令包：将通过 npx 首次运行时自动获取（无需单独安装）\r\n".into(),
     ));
 
-    // --- 2. Fast path: a usable Node is already present ----------------
+    // --- 2. 快速路径：本机已有可用的 Node ---------------------------------
     if let Some(npx) = usable_npx {
         let _ = proxy.send_event(UserEvent::Term("✓ 运行环境就绪，准备启动服务…\r\n".into()));
         launch_terminal(npx, proxy, handle, input_writer, user_took_over, exited);
         return;
     }
 
-    // --- 3. Slow path: auto-install a portable Node ---------------------
+    // --- 3. 慢速路径：自动安装便携版 Node ---------------------------------
     let _ = proxy.send_event(UserEvent::Term(format!("✗ {}\r\n", install_reason)));
     let _ = proxy.send_event(UserEvent::Status("正在准备自动安装 Node.js 运行环境…".into()));
 
@@ -115,6 +114,7 @@ pub fn run_environment_flow(
     let home = cache.join(format!("node-v{}-{}", crate::NODE_VERSION, target));
     let npx = node_npx_path(&home);
 
+    // 尚未安装过：下载并解压（下载进度通过 proxy 实时上报）
     if !npx.is_file() {
         match download_and_extract_node(&target, &cache, &proxy) {
             Ok(()) => {}
@@ -138,10 +138,10 @@ pub fn run_environment_flow(
     }
 }
 
-/// Download the portable Node.js archive for `target` into `cache`, reporting
-/// download progress through `proxy`, then extract it. Uses `curl`
-/// (falls back to `wget`), which ship by default on macOS, modern Windows 10+,
-/// and most Linux distributions. No admin rights required.
+/// 把 `target` 平台的便携版 Node.js 压缩包下载到 `cache` 目录（下载进度
+/// 通过 `proxy` 上报），然后解压。使用 `curl`（失败时回退到 `wget`）——
+/// 这两个工具在 macOS、Windows 10+ 和大多数 Linux 发行版上都预装。
+/// 无需管理员权限。
 fn download_and_extract_node(
     target: &str,
     cache: &Path,
@@ -150,6 +150,7 @@ fn download_and_extract_node(
     fs::create_dir_all(cache)
         .map_err(|e| format!("无法创建缓存目录 {}: {}", cache.display(), e))?;
 
+    // Windows 用 zip 包，其余平台用 tar.gz 包
     let (url, ext) = if cfg!(windows) {
         (
             format!(
@@ -170,7 +171,7 @@ fn download_and_extract_node(
 
     let tmp = cache.join(format!("node-{}.{}", target, ext));
 
-    // Total size for a determinate progress bar (best effort).
+    // 提前拿到总大小，用于展示确定性进度条（尽力而为，失败则不显示百分比）。
     let total = http_content_length(&url).unwrap_or(0);
 
     let _ = proxy.send_event(UserEvent::Term(
@@ -178,7 +179,7 @@ fn download_and_extract_node(
     ));
     let _ = proxy.send_event(UserEvent::Status("正在下载 Node.js 运行环境…".into()));
 
-    // Start the download (writes straight to the temp file).
+    // 启动下载（直接写入临时文件）
     let mut dl = Command::new("curl")
         .args(["-fsSL", &url, "-o", &tmp.to_string_lossy()])
         .spawn()
@@ -189,8 +190,8 @@ fn download_and_extract_node(
         })
         .map_err(|e| format!("无法启动下载工具（curl/wget 均不可用）: {}", e))?;
 
-    // Poll the temp file size and render it as a live, rewriting terminal line
-    // (carriage-return progress, just like a real CLI download bar).
+    // 轮询临时文件大小，在终端里渲染成不断原地刷新的进度行
+    // （用回车符覆盖，就像真实 CLI 的下载进度条）。
     let mut last_pct: i32 = -1;
     loop {
         if let Ok(m) = fs::metadata(&tmp) {
@@ -199,6 +200,7 @@ fn download_and_extract_node(
             } else {
                 -1
             };
+            // 百分比变化时才刷新，避免刷屏
             if pct != last_pct {
                 last_pct = pct;
                 if pct >= 0 {
@@ -231,11 +233,12 @@ fn download_and_extract_node(
         ));
     }
 
-    // Finish the rewriting progress line, then move on.
+    // 结束原地刷新的进度行，进入解压阶段。
     let _ = proxy.send_event(UserEvent::Term("\r\n".into()));
     let _ = proxy.send_event(UserEvent::Term("✓ 下载完成，正在解压 Node.js…\r\n".into()));
     let _ = proxy.send_event(UserEvent::Status("正在解压 Node.js 运行环境…".into()));
 
+    // Windows 用 PowerShell 的 Expand-Archive 解压，其余平台用 tar
     let ok = if cfg!(windows) {
         let ps = format!(
             "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
@@ -255,6 +258,7 @@ fn download_and_extract_node(
             .unwrap_or(false)
     };
 
+    // 压缩包已无用，清理掉。
     let _ = fs::remove_file(&tmp);
 
     if !ok {
@@ -265,7 +269,7 @@ fn download_and_extract_node(
     Ok(())
 }
 
-/// HEAD the URL and return its Content-Length, if available.
+/// 对 URL 发 HEAD 请求，返回 Content-Length（如果服务端提供）。
 pub(crate) fn http_content_length(url: &str) -> Option<u64> {
     let out = Command::new("curl")
         .args(["-sI", "--max-time", "20", url])
@@ -281,22 +285,22 @@ pub(crate) fn http_content_length(url: &str) -> Option<u64> {
     None
 }
 
-/// Minimum Node.js version required by `@deepseek-ai/dsh` at runtime. The
-/// package uses several v22-era APIs:
+/// `@deepseek-ai/dsh` 运行时所需的最低 Node.js 版本。
+/// 该包使用了多个 v22 时代的 API：
 ///   - `node:zlib.createZstdDecompress`  (v22.15.0+)
 ///   - `Promise.withResolvers`           (v22.0.0+)
 ///   - `node:module.stripTypeScriptTypes`(v22.14.0+)
-/// so the floor is **v22.15.0**. Anything below that — including Node 20.x —
-/// is rejected and the portable v22 build is used instead.
+/// 因而下限是 **v22.15.0**。低于该版本 —— 包括 Node 20.x ——
+/// 都会被拒绝，转而使用便携版 v22。
 const MIN_NODE_MAJOR: u32 = 22;
 const MIN_NODE_MINOR: u32 = 15;
 
-/// True when `v` is at least the minimum supported Node.js version.
+/// `v` 是否不低于最低支持的 Node.js 版本。
 fn node_meets_min(v: (u32, u32, u32)) -> bool {
     v.0 > MIN_NODE_MAJOR || (v.0 == MIN_NODE_MAJOR && v.1 >= MIN_NODE_MINOR)
 }
 
-/// Parse a `node --version` string like `v20.9.0` into (major, minor, patch).
+/// 把 `node --version` 输出（如 `v20.9.0`）解析为 (major, minor, patch)。
 fn parse_node_version(s: &str) -> Option<(u32, u32, u32)> {
     let s = s.trim().trim_start_matches('v');
     let parts: Vec<&str> = s.split('.').collect();
@@ -305,6 +309,7 @@ fn parse_node_version(s: &str) -> Option<(u32, u32, u32)> {
     }
     let major: u32 = parts[0].parse().ok()?;
     let minor: u32 = parts[1].parse().ok()?;
+    // patch 段可能带后缀（如 "9.0-nightly20240101"），只取前导数字。
     let patch: u32 = if parts.len() > 2 {
         parts[2]
             .split(|c: char| !c.is_ascii_digit())
@@ -317,9 +322,9 @@ fn parse_node_version(s: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Return the version of the Node.js that owns `npx` (its sibling `node`).
-/// Probes the binary directly instead of relying on `PATH`, which is minimal
-/// when launched from a GUI `.app`.
+/// 返回 `npx` 所属 Node.js（同目录下的 `node`）的版本号。
+/// 直接探测二进制文件，而不是依赖 `PATH` —— 从 GUI `.app` 启动时
+/// `PATH` 非常精简，不可靠。
 fn npx_node_version(npx: &Path) -> Option<(u32, u32, u32)> {
     let node = npx.parent()?.join("node");
     if !node.is_file() {
@@ -332,21 +337,21 @@ fn npx_node_version(npx: &Path) -> Option<(u32, u32, u32)> {
     parse_node_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Locate an `npx` executable we can actually run `@deepseek-ai/dsh` with.
+/// 定位一个真正能用来运行 `@deepseek-ai/dsh` 的 `npx` 可执行文件。
 ///
-/// A GUI `.app` gets a minimal `PATH`, so we probe common Node install
-/// locations, nvm, and the (minimal) PATH. Crucially we do **not** just return
-/// the first existing `npx` file: a machine often has several Node installs
-/// side by side — e.g. an old system Node v20 at `/usr/local/bin` *and* a
-/// working v22 installed via nvm — and the first file on disk is usually the
-/// wrong, too-old one (which is exactly why the same command can work in the
-/// user's terminal but fail inside this app). So we scan in priority order and
-/// return the **first `npx` whose Node meets the minimum version**
-/// (`node_meets_min`). If none qualify we return the first existing `npx`
-/// anyway, so the caller can report "version too low" rather than "not
-/// installed", and only then do we fall back to the downloaded portable Node.
-/// Override everything with `DSH_NPX`.
+/// GUI `.app` 拿到的 `PATH` 非常精简，因此我们主动探测常见的 Node
+/// 安装位置、nvm 目录以及（精简版的）PATH。关键在于：**不是**找到
+/// 第一个存在的 `npx` 文件就直接返回 —— 一台机器上往往并存着多个
+/// Node 安装，例如 `/usr/local/bin` 里一个过时的系统级 Node v20，
+/// 同时 nvm 里又装了能用的 v22 —— 而排在最前的那个文件通常是错的、
+/// 版本过低的那个（这正是"同一条命令在用户终端里能跑、在这个应用里
+/// 失败"的原因）。所以我们按优先级顺序扫描，返回**第一个其 Node
+/// 满足最低版本要求**的 `npx`（`node_meets_min`）。如果一个合格的
+/// 都没有，就返回第一个存在的 `npx`，这样调用方能报告"版本过低"
+/// 而不是"未安装"，之后才回退到下载的便携版 Node。
+/// 可用环境变量 `DSH_NPX` 覆盖以上所有逻辑。
 fn resolve_npx() -> Option<PathBuf> {
+    // 环境变量指定的 npx 优先级最高
     if let Ok(p) = std::env::var("DSH_NPX") {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -359,29 +364,29 @@ fn resolve_npx() -> Option<PathBuf> {
         if !c.is_file() {
             continue;
         }
+        // 记住第一个存在的 npx，作为"找不到合格版本"时的兜底
         if first_existing.is_none() {
             first_existing = Some(c.clone());
         }
-        // Prefer the first candidate whose Node is new enough.
+        // 优先返回第一个 Node 版本达标的候选
         if let Some(v) = npx_node_version(&c) {
             if node_meets_min(v) {
                 return Some(c);
             }
         }
-        // Unreadable version: keep scanning; fall back to it only if nothing
-        // better turns up.
+        // 版本读不出来：继续扫描；仅在没有更好选择时才会兜底到它。
     }
     first_existing
 }
 
-/// Build the ordered list of candidate `npx` paths.
+/// 构造按优先级排序的 `npx` 候选路径列表。
 fn npx_candidates() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/usr/local/bin/npx"),
         PathBuf::from("/opt/homebrew/bin/npx"),
         PathBuf::from("/usr/bin/npx"),
-        // Managed runtime used in this environment.
+        // 本开发环境中使用的托管运行时
         PathBuf::from("/Users/shaipe/.workbuddy/binaries/node/versions/22.22.2/bin/npx"),
     ];
 
@@ -393,7 +398,7 @@ fn npx_candidates() -> Vec<PathBuf> {
         }
     }
 
-    // Everything currently on PATH.
+    // 当前 PATH 上的所有目录
     if let Ok(path_env) = std::env::var("PATH") {
         for dir in path_env.split(':') {
             if !dir.is_empty() {
@@ -405,8 +410,8 @@ fn npx_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// Build the Node.js distribution target suffix for the current platform,
-/// e.g. `darwin-arm64`, `linux-x64`, `win-x64`.
+/// 构造当前平台对应的 Node.js 发行包 target 后缀，
+/// 例如 `darwin-arm64`、`linux-x64`、`win-x64`。
 fn node_target() -> String {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
@@ -423,8 +428,8 @@ fn node_target() -> String {
     format!("{}-{}", os, arch)
 }
 
-/// Local cache directory for app-managed downloads (portable Node, update
-/// packages). Shared with `updater.rs`.
+/// 应用管理下载的本地缓存目录（便携版 Node、升级包）。
+/// 与 `updater.rs` 共用。
 pub(crate) fn cache_dir() -> Result<PathBuf, String> {
     let base = if cfg!(windows) {
         std::env::var("LOCALAPPDATA")
@@ -436,6 +441,7 @@ pub(crate) fn cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(base).join("dsh-desktop"))
 }
 
+/// 便携版 Node 中 npx 的路径（Windows 与 Unix 目录结构不同）。
 #[cfg(windows)]
 fn node_npx_path(home: &Path) -> PathBuf {
     home.join("npx.cmd")
