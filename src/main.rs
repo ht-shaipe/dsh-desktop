@@ -119,9 +119,12 @@ pub enum UserEvent {
 /// 显示一个原生浮动提示窗口，2 秒后自动消失。
 #[cfg(target_os = "macos")]
 fn show_native_toast(text: &str) {
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use objc2::runtime::{AnyClass, AnyObject};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    // Ensure null-terminated C string for stringWithUTF8String:
+    let c_text = CString::new(text).unwrap_or_default();
 
     unsafe {
         let ns_str = CStr::from_bytes_with_nul_unchecked(b"NSString\0");
@@ -153,7 +156,7 @@ fn show_native_toast(text: &str) {
         let label: *mut AnyObject = objc2::msg_send![label,
             initWithFrame: NSRect::new(NSPoint::new(16.0, 10.0), NSSize::new(188.0, 20.0))
         ];
-        let text_str: *mut AnyObject = objc2::msg_send![ns_str_cls, stringWithUTF8String: text.as_ptr()];
+        let text_str: *mut AnyObject = objc2::msg_send![ns_str_cls, stringWithUTF8String: c_text.as_ptr()];
         let font: *mut AnyObject = objc2::msg_send![ns_font_cls, systemFontOfSize: 13.0f64];
         let white: *mut AnyObject = objc2::msg_send![ns_color_cls, labelColor];
         let _: () = objc2::msg_send![label, setStringValue: text_str];
@@ -172,10 +175,21 @@ fn show_native_toast(text: &str) {
         let _: () = objc2::msg_send![panel, setFrameOrigin: NSPoint::new(x, y)];
         let _: () = objc2::msg_send![panel, orderFrontRegardless];
 
-        // Auto-close after 2 seconds using performSelector:afterDelay: (main thread safe)
-        let close_sel = objc2::sel!(close);
-        let nil_obj: *mut AnyObject = std::ptr::null_mut();
-        let _: () = objc2::msg_send![panel, performSelector: close_sel, withObject: nil_obj, afterDelay: 2.0f64];
+        // 2 秒后自动关闭面板。
+        // 用 scheduledTimerWithTimeInterval:（自动挂到当前 run loop）。
+        // 注意：旧的 timerWithFireDate:target:... 类方法在新版 macOS 运行时
+        // 里已被移除（objc2 校验会 panic "method not found"），不能使用；
+        // initWithFireDate:interval:... 虽然还在但已弃用。
+        // NSTimer 会 retain target（即 panel），面板得以存活到触发 close。
+        let timer_cls = AnyClass::get(CStr::from_bytes_with_nul_unchecked(b"NSTimer\0")).unwrap();
+        let sel = objc2::sel!(close);
+        let _: *mut AnyObject = objc2::msg_send![timer_cls,
+            scheduledTimerWithTimeInterval: 2.0f64,
+            target: panel,
+            selector: sel,
+            userInfo: std::ptr::null_mut::<AnyObject>(),
+            repeats: false
+        ];
     }
 }
 
@@ -354,7 +368,7 @@ fn main() {
                 UserEvent::UpdateDone(tag) => {
                     if tag.is_empty() {
                         #[cfg(target_os = "macos")]
-                        show_native_toast("已是最新版本");
+                        { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast("已是最新版本"))); }
                         #[cfg(not(target_os = "macos"))]
                         let _ = webview.evaluate_script("showUpdateToast('已是最新版本')");
                     } else {
