@@ -73,15 +73,19 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
 
       # 应用包名保持 dsh-desktop.app（不加平台区分）；仅 .dmg 压缩包加平台区分。
+      # 统一走 package-dmg.sh 打包，保证 DMG 内包含 Applications 软链（拖拽安装）
+      # 和 使用说明.txt；DSH_BIN 指定预编译二进制，DMG_OUT 指定输出文件名。
       # 两次打包依次进行，每次 build 后立即出 dmg，避免第二次 rm -rf dsh-desktop.app
       # 覆盖第一次的产物（dmg 已先行生成，不受影响）。
       - name: Package (two arch-specific .dmg; app name stays plain)
         run: |
-          DSH_BIN=target/aarch64-apple-darwin/release/dsh-desktop bash package-macos.sh
-          hdiutil create -srcfolder dsh-desktop.app -format UDZO -ov -o dsh-desktop-macos-aarch64.dmg
+          DSH_BIN=target/aarch64-apple-darwin/release/dsh-desktop \
+          DMG_OUT=dsh-desktop-macos-aarch64.dmg \
+            bash package-dmg.sh
 
-          DSH_BIN=target/x86_64-apple-darwin/release/dsh-desktop bash package-macos.sh
-          hdiutil create -srcfolder dsh-desktop.app -format UDZO -ov -o dsh-desktop-macos-x86_64.dmg
+          DSH_BIN=target/x86_64-apple-darwin/release/dsh-desktop \
+          DMG_OUT=dsh-desktop-macos-x86_64.dmg \
+            bash package-dmg.sh
 
       - name: Sign update packages
         if: env.DSH_UPDATER_PRIVATE_KEY != ''

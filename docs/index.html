@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>dsh-desktop — 把 DeepSeek dsh 装进桌面窗口</title>
-  <meta name="description" content="一个极简的 Rust 桌面壳，双击即用，自动拉起 DeepSeek dsh web，内嵌终端实时显示进度，跨平台自动发版。">
+  <meta name="description" content="一个极简的 Rust 桌面壳，双击即用，自动拉起 DeepSeek dsh web，内嵌终端实时显示进度，自动更新，跨平台自动发版。">
   <style>
     :root {
       --bg: #0d1117;
@@ -41,26 +41,59 @@
     }
     .wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
 
-    /* ── Hero ── */
-    header {
-      padding: 80px 0 56px;
-      text-align: center;
+    /* ── 顶部导航 ── */
+    nav {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(13, 17, 23, .82);
+      backdrop-filter: blur(10px);
       border-bottom: 1px solid var(--border);
     }
+    nav .wrap {
+      display: flex; align-items: center; justify-content: space-between;
+      height: 56px;
+    }
+    nav .logo { font-weight: 700; font-size: 1.05rem; color: var(--text); }
+    nav .logo .dash { color: var(--accent); }
+    nav .links { display: flex; gap: 22px; align-items: center; }
+    nav .links a { color: var(--text-muted); font-size: .92rem; }
+    nav .links a:hover { color: var(--text); text-decoration: none; }
+    nav .gh-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      padding: 5px 14px; border-radius: 20px; color: var(--text) !important;
+      font-size: .88rem;
+    }
+    nav .gh-btn:hover { border-color: var(--accent); }
+    @media (max-width: 640px) { nav .links a.hide-sm { display: none; } }
+
+    /* ── Hero ── */
+    header {
+      padding: 72px 0 56px;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+      overflow: hidden;
+    }
+    /* 顶部柔光背景 */
+    header::before {
+      content: "";
+      position: absolute; inset: -40% 0 auto;
+      height: 480px;
+      background:
+        radial-gradient(600px 220px at 30% 0%, rgba(88, 166, 255, .13), transparent 70%),
+        radial-gradient(500px 200px at 70% 0%, rgba(63, 185, 80, .09), transparent 70%);
+      pointer-events: none;
+    }
+    header .wrap { position: relative; }
     header h1 {
-      font-size: 2.8rem;
-      font-weight: 800;
-      letter-spacing: -1px;
-      margin-bottom: 12px;
+      font-size: 2.8rem; font-weight: 800; letter-spacing: -1px; margin-bottom: 12px;
     }
     header h1 .dash { color: var(--accent); }
     header .tagline {
-      font-size: 1.15rem;
-      color: var(--text-muted);
-      max-width: 600px;
-      margin: 0 auto 32px;
+      font-size: 1.15rem; color: var(--text-muted);
+      max-width: 620px; margin: 0 auto 30px;
     }
-    .badges { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; }
+    .badges { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 34px; }
     .badge {
       display: inline-flex; align-items: center; gap: 6px;
       background: var(--bg-card); border: 1px solid var(--border);
@@ -75,9 +108,43 @@
       border: 1px solid transparent; transition: all .2s;
     }
     .btn-primary { background: var(--accent); color: #0d1117; }
-    .btn-primary:hover { background: #79b8ff; text-decoration: none; }
+    .btn-primary:hover { background: #79b8ff; text-decoration: none; transform: translateY(-1px); }
     .btn-ghost { background: var(--bg-card); color: var(--text); border-color: var(--border); }
     .btn-ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+    /* ── 应用窗口示意图（纯 CSS） ── */
+    .mockup-wrap { display: flex; justify-content: center; margin-top: 52px; }
+    .mockup {
+      width: 100%; max-width: 720px; text-align: left;
+      background: #0b0e14; border: 1px solid var(--border);
+      border-radius: 12px; overflow: hidden;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, .5), 0 0 0 1px rgba(88, 166, 255, .04);
+    }
+    .mockup .m-titlebar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 14px; background: #161b25; border-bottom: 1px solid #232b39;
+      font-size: 12px; color: #8b93a3;
+    }
+    .mockup .lights { display: flex; gap: 7px; margin-right: 10px; }
+    .mockup .lights i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+    .mockup .lights i:nth-child(1) { background: #ff5f57; }
+    .mockup .lights i:nth-child(2) { background: #febc2e; }
+    .mockup .lights i:nth-child(3) { background: #28c840; }
+    .mockup .m-title { flex: 1; text-align: center; }
+    .mockup .m-actions { display: flex; gap: 12px; font-size: 11px; color: #9ecbff; }
+    .mockup .m-actions .ver { color: #8b93a3; }
+    .mockup pre {
+      margin: 0; padding: 16px 18px 20px;
+      font: 12px/1.75 "SF Mono", "Fira Code", Consolas, monospace;
+      color: #cfe3ff; white-space: pre-wrap;
+    }
+    .mockup .ok { color: var(--accent-2); }
+    .mockup .dim { color: #8b93a3; }
+    .mockup .url { color: #9ecbff; }
+    .mockup .m-status {
+      padding: 8px 16px; background: #161b25; border-top: 1px solid #232b39;
+      font-size: 11.5px; color: #7ee0a0;
+    }
 
     /* ── Section ── */
     section { padding: 64px 0; border-bottom: 1px solid var(--border); }
@@ -139,6 +206,29 @@
     .platform .os { font-size: 1.3rem; margin-bottom: 6px; }
     .platform .pkg { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 10px; }
     .platform .note { color: var(--text-muted); font-size: 0.8rem; }
+    .platform .dl {
+      display: inline-block; margin-top: 10px; padding: 6px 18px;
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: 8px; font-size: .85rem; color: var(--accent);
+    }
+    .platform .dl:hover { border-color: var(--accent); text-decoration: none; }
+
+    /* ── FAQ ── */
+    .faq { display: flex; flex-direction: column; gap: 12px; max-width: 760px; }
+    details {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px 22px;
+    }
+    details:hover { border-color: #3d4653; }
+    details summary {
+      cursor: pointer; font-weight: 600; font-size: 1rem;
+      list-style: none; display: flex; align-items: center; gap: 10px;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: "＋"; color: var(--accent); font-weight: 400; }
+    details[open] summary::before { content: "－"; }
+    details .a { margin-top: 10px; color: var(--text-muted); font-size: 0.94rem; }
+    details .a code { font-size: 0.86em; }
 
     /* ── Tech stack ── */
     .stack { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -157,25 +247,60 @@
       header h1 { font-size: 2rem; }
       header .tagline { font-size: 1rem; }
       section { padding: 48px 0; }
+      .mockup .m-actions { display: none; }
     }
   </style>
 </head>
 <body>
 
+<!-- ═══════ 顶部导航 ═══════ -->
+<nav>
+  <div class="wrap">
+    <span class="logo">dsh<span class="dash">-</span>desktop</span>
+    <div class="links">
+      <a href="#features" class="hide-sm">特性</a>
+      <a href="#how" class="hide-sm">原理</a>
+      <a href="#usage" class="hide-sm">下载</a>
+      <a href="#faq" class="hide-sm">FAQ</a>
+      <a class="gh-btn" href="https://github.com/ht-shaipe/dsh-desktop">★ GitHub</a>
+    </div>
+  </div>
+</nav>
+
 <!-- ═══════ Hero ═══════ -->
 <header>
   <div class="wrap">
     <h1>dsh<span class="dash">-</span>desktop</h1>
-    <p class="tagline">把 DeepSeek <code>dsh web</code> 装进一个原生桌面窗口——双击即用，关窗即停。</p>
+    <p class="tagline">把 DeepSeek <code>dsh web</code> 装进一个原生桌面窗口——双击即用，自动更新，关窗即停。</p>
     <div class="badges">
       <span class="badge"><span class="dot" style="background:var(--accent-2)"></span> Rust</span>
       <span class="badge"><span class="dot" style="background:var(--accent)"></span> tao + wry</span>
-      <span class="badge"><span class="dot" style="background:var(--accent-3)"></span> 跨平台</span>
-      <span class="badge"><span class="dot" style="background:var(--danger)"></span> 自包含二进制</span>
+      <span class="badge"><span class="dot" style="background:var(--accent-3)"></span> 自动更新 · 签名校验</span>
+      <span class="badge"><span class="dot" style="background:var(--danger)"></span> 跨平台</span>
     </div>
     <div class="cta">
-      <a class="btn btn-primary" href="https://github.com/ht-shaipe/dsh-desktop/releases">⬇ 下载发布版</a>
+      <a class="btn btn-primary" href="https://github.com/ht-shaipe/dsh-desktop/releases/latest">⬇ 下载最新版</a>
       <a class="btn btn-ghost" href="https://github.com/ht-shaipe/dsh-desktop">★ GitHub 源码</a>
+    </div>
+
+    <!-- 应用窗口示意（纯 CSS 绘制） -->
+    <div class="mockup-wrap">
+      <div class="mockup">
+        <div class="m-titlebar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="m-title">DeepSeek dsh Desktop</span>
+          <span class="m-actions">
+            <span>检查更新</span><span>帮助</span><span class="ver">v0.1.5</span>
+          </span>
+        </div>
+        <pre><span class="dim">=== 启动前环境自检 ===</span>
+<span class="ok">✓</span> Node.js 运行环境 (npx)
+<span class="ok">✓</span> 运行环境就绪，准备启动服务…
+<span class="dim">$</span> npx -y @deepseek-ai/dsh web
+dsh web: <span class="url">http://127.0.0.1:3080/?token=3I3a…</span>
+<span class="dim">→ 正在打开页面…</span></pre>
+        <div class="m-status">● 服务运行中 — 关闭窗口自动停止后台进程</div>
+      </div>
     </div>
   </div>
 </header>
@@ -199,17 +324,27 @@
       <div class="card">
         <span class="icon">🤖</span>
         <h3>智能自动应答</h3>
-        <p>检测到 <code>(y/N)</code> 确认时自动回复 <code>y</code>，黄色横幅原样展示问题文字，关闭回显避免噪音。</p>
+        <p>检测到 <code>(y/N)</code> 确认时自动回复 <code>y</code>，黄色横幅原样展示问题文字；用户手动输入后立即交还控制权。</p>
       </div>
       <div class="card">
         <span class="icon">🔍</span>
         <h3>环境自检 + 便携 Node</h3>
-        <p>启动前逐项检测环境；Node 版本过低或缺失时，自动从国内镜像下载便携版 v22.23.2，零额外配置。</p>
+        <p>启动前逐项检测环境；Node 缺失或版本过低时，自动从国内镜像下载便携版 v22，零额外配置、无需管理员权限。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🔄</span>
+        <h3>应用内自动更新</h3>
+        <p>标题栏一键"检查更新"，自动从 GitHub Releases 下载并原地替换；minisign 签名校验，防篡改。</p>
       </div>
       <div class="card">
         <span class="icon">🧹</span>
-        <h3>干净退出</h3>
-        <p>关闭窗口即 <code>killpg</code> 杀掉整个进程组（含 npx 拉起的 node 子进程），不留后台残留。</p>
+        <h3>干净退出 + 端口自清理</h3>
+        <p>关窗即 <code>killpg</code> 杀掉整个进程组；残留进程占用 3080 端口时启动前自动识别并清理。</p>
+      </div>
+      <div class="card">
+        <span class="icon">💊</span>
+        <h3>帮助窗口 / 原生提示</h3>
+        <p>标题栏常驻"帮助"按钮，独立窗口展示使用说明；更新完成等状态用系统原生 Toast 通知。</p>
       </div>
       <div class="card">
         <span class="icon">📦</span>
@@ -228,44 +363,51 @@
     <div class="flow">
       <div class="flow-step">
         <span class="label">环境自检</span>
-        <span class="desc">→ 打印检测清单（✓/✗），找到 npx 则复用，否则自动下载便携版 Node.js</span>
+        <span class="desc">→ 打印检测清单（✓/✗），找到达标的 npx 则复用，否则自动下载便携版 Node.js</span>
       </div>
       <div class="flow-step">
         <span class="label">启动命令</span>
         <span class="desc">→ 以伪终端（PTY）运行 <code>npx -y @deepseek-ai/dsh web</code>，内置终端实时显示输出</span>
       </div>
       <div class="flow-step">
-        <span class="label">端口就绪</span>
-        <span class="desc">→ 轮询 <code>127.0.0.1:3080</code>，一旦就绪自动跳转，窗口显示 dsh 的 Web 界面</span>
+        <span class="label">解析认证地址</span>
+        <span class="desc">→ 从输出中提取带 token 的服务地址（而非裸端口），保证直接进入已登录界面</span>
+      </div>
+      <div class="flow-step">
+        <span class="label">自动跳转</span>
+        <span class="desc">→ 端口就绪后原生导航到认证 URL，窗口切换为 dsh 的 Web 界面</span>
       </div>
       <div class="flow-step">
         <span class="label">关闭窗口</span>
-        <span class="desc">→ <code>killpg</code> 杀掉整个进程组，干净退出</span>
+        <span class="desc">→ <code>killpg</code> 杀掉整个进程组，干净退出，不留后台残留</span>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ═══════ 使用方式 ═══════ -->
+<!-- ═══════ 下载使用 ═══════ -->
 <section id="usage">
   <div class="wrap">
-    <h2><span class="num">03</span> 怎么用</h2>
-    <p class="lead">到 Releases 页下载对应平台包，双击即可。</p>
+    <h2><span class="num">03</span> 下载使用</h2>
+    <p class="lead">到 Releases 页下载对应平台包，双击即可，无需安装。</p>
     <div class="platforms">
       <div class="platform">
         <div class="os">🍎 macOS</div>
-        <div class="pkg">.dmg（aarch64 / x86_64）</div>
-        <div class="note">拖入「应用程序」；首次被拦截右键「打开」或 <code>xattr -cr</code></div>
+        <div class="pkg">.dmg（Apple Silicon / Intel）</div>
+        <div class="note">拖入「应用程序」即可；被 Gatekeeper 拦截时见下方 FAQ</div>
+        <a class="dl" href="https://github.com/ht-shaipe/dsh-desktop/releases/latest">获取 .dmg →</a>
       </div>
       <div class="platform">
         <div class="os">🐧 Linux</div>
         <div class="pkg">.tar.gz</div>
         <div class="note">解压后运行；需系统已装 <code>webkit2gtk-4.1</code></div>
+        <a class="dl" href="https://github.com/ht-shaipe/dsh-desktop/releases/latest">获取 .tar.gz →</a>
       </div>
       <div class="platform">
         <div class="os">🪟 Windows</div>
         <div class="pkg">.zip</div>
         <div class="note">解压后运行 .exe；Win11 自带 WebView2</div>
+        <a class="dl" href="https://github.com/ht-shaipe/dsh-desktop/releases/latest">获取 .zip →</a>
       </div>
     </div>
     <div class="code-block">
@@ -281,24 +423,58 @@
   </div>
 </section>
 
+<!-- ═══════ FAQ ═══════ -->
+<section id="faq">
+  <div class="wrap">
+    <h2><span class="num">04</span> 常见问题</h2>
+    <p class="lead">装不上、打不开、跑得慢？大概率是这几个。</p>
+    <div class="faq">
+      <details>
+        <summary>macOS 提示「已损坏，无法打开」怎么办？</summary>
+        <p class="a">这是 macOS 给网络下载应用加的隔离标记，应用本身并没有损坏。打开「终端」执行：<br>
+        <code>sudo xattr -cr /Applications/dsh-desktop.app</code><br>
+        输入开机密码后再双击打开即可。</p>
+      </details>
+      <details>
+        <summary>首次启动特别慢，是卡住了吗？</summary>
+        <p class="a">不是。首次运行需要下载 Node 运行环境（如缺失）和 dsh 依赖包，视网络情况可能需要几分钟；窗口内终端会实时显示进度，状态栏也有"仍在工作中"的心跳提示。之后再启动会直接复用缓存，秒级完成。</p>
+      </details>
+      <details>
+        <summary>提示端口 3080 被占用？</summary>
+        <p class="a">一般是上次未正常退出留下的残留进程，应用会尝试自动清理。若仍提示占用，可在终端执行 <code>lsof -iTCP:3080 -sTCP:LISTEN</code> 找到 PID 后 <code>kill -9 &lt;PID&gt;</code>，再重开应用。</p>
+      </details>
+      <details>
+        <summary>怎么升级到新版本？</summary>
+        <p class="a">点击窗口标题栏的「检查更新」即可：应用会自动从 GitHub Releases 下载对应平台的安装包，经 minisign 签名校验后原地替换，按提示重启即生效。离线时自动跳过检查，不影响使用。</p>
+      </details>
+      <details>
+        <summary>没有 Node.js 能用吗？</summary>
+        <p class="a">可以。应用会自动下载一份便携版 Node.js 到 <code>~/.cache/dsh-desktop</code>，不需要管理员权限，也不改动系统环境。若本机已有 Node ≥ v22.15，则优先复用系统版本；还可用环境变量 <code>DSH_NPX</code> 指定自定义 npx 路径。</p>
+      </details>
+    </div>
+  </div>
+</section>
+
 <!-- ═══════ 技术栈 ═══════ -->
 <section id="tech">
   <div class="wrap">
-    <h2><span class="num">04</span> 技术栈</h2>
+    <h2><span class="num">05</span> 技术栈</h2>
     <p class="lead">和 Tauri 同源，但更底层、更轻量——因为要启动的是外部子进程，不是自己的前端。</p>
     <div class="stack">
       <span><strong>Rust</strong> 系统语言</span>
       <span><strong>tao</strong> 0.30 窗口管理</span>
       <span><strong>wry</strong> 0.49 原生 WebView</span>
       <span><strong>libc::forkpty</strong> 伪终端（PTY）</span>
+      <span><strong>minisign</strong> 更新包签名校验</span>
       <span><strong>include_str!</strong> 编译期内嵌资源</span>
       <span><strong>GitHub Actions</strong> 跨平台自动发版</span>
     </div>
     <div class="code-block">
 <pre><span class="path">src/</span>
-<span class="path">├── main.rs</span>        <span class="comment"># 入口：窗口/webview、事件循环、进程句柄</span>
+<span class="path">├── main.rs</span>        <span class="comment"># 入口：窗口/webview、事件循环、标题栏控件、帮助窗口</span>
 <span class="path">├── environment.rs</span> <span class="comment"># 环境自检 + 便携 Node 下载</span>
-<span class="path">├── terminal.rs</span>    <span class="comment"># PTY/管道启动子进程 + 输出读取</span>
+<span class="path">├── terminal.rs</span>    <span class="comment"># PTY/管道启动子进程 + 输出读取 + 提示检测</span>
+<span class="path">├── updater.rs</span>     <span class="comment"># 自动更新：Release 检查 + 签名校验 + 三平台安装</span>
 <span class="path">└── ui.rs</span>          <span class="comment"># HTML/JS 资源 + 字符串转义工具</span></pre>
     </div>
   </div>

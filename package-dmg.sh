@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Package dsh-desktop as a distributable .dmg (macOS).
-# Requires Xcode Command Line Tools (hdiutil) and a GUI session for the
-# cosmetic window layout (the layout step is non-fatal if it can't run).
+# 把 dsh-desktop 打包为可分发的 .dmg（macOS）。
+#
+# DMG 内容：dsh-desktop.app + Applications 软链（拖拽安装）+ 使用说明.txt。
+#
+# 环境变量（均可选，供 CI 跨架构打包使用）：
+#   DSH_BIN  - 指定预编译的二进制路径；未设置时先执行 cargo build --release
+#   DMG_OUT  - 输出的 .dmg 文件名；默认 dsh-desktop.dmg
+#
+# 依赖 Xcode Command Line Tools（hdiutil）；美化窗口布局需要 GUI 会话，
+# 无 GUI（CI/无头环境）时布局步骤自动跳过，不影响出包。
 set -euo pipefail
 
 APP_NAME="dsh-desktop"
 VOL_NAME="DeepSeek dsh Web"
-DMG_NAME="dsh-desktop.dmg"
+DMG_NAME="${DMG_OUT:-dsh-desktop.dmg}"
 RW_DMG="dsh-desktop-rw.dmg"
 STAGING="dmg-staging"
 MNT="/Volumes/$VOL_NAME"
 
-# 1. Make sure the .app bundle is built and up to date.
+# 1. 先生成 .app 包（DSH_BIN 会透传给 package-macos.sh，跳过本地构建）。
 if [ ! -x ./package-macos.sh ]; then
   echo "error: ./package-macos.sh not found" >&2
   exit 1
@@ -27,10 +34,10 @@ ln -s /Applications "$STAGING/Applications"
 # 3. Copy usage instructions
 cp "使用说明.txt" "$STAGING/"
 
-# 3. Build a read-write image from the staged folder.
+# 4. Build a read-write image from the staged folder.
 hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGING" -format UDRW -ov "$RW_DMG"
 
-# 4. Mount, apply cosmetic layout (non-fatal), then unmount.
+# 5. Mount, apply cosmetic layout (non-fatal), then unmount.
 #    Guarded so a headless/CI environment still yields a usable DMG.
 hdiutil attach "$RW_DMG" -nobrowse -noautoopen || true
 set +e
@@ -56,7 +63,7 @@ EOF
 set -e
 hdiutil detach "$MNT" -quiet || hdiutil detach "$MNT" -force || true
 
-# 5. Convert to a compressed, read-only DMG and clean up.
+# 6. Convert to a compressed, read-only DMG and clean up.
 hdiutil convert "$RW_DMG" -format UDZO -ov -o "$DMG_NAME"
 rm -f "$RW_DMG"
 rm -rf "$STAGING"
