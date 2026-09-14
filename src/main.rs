@@ -5,12 +5,14 @@
 //! Source layout:
 //! - `main.rs`      — entry point, window/webview, event loop
 //! - `environment.rs` — env check + portable Node install
+//! - `updater.rs`    — self-update via GitHub Releases
 //! - `terminal.rs`  — PTY/piped command launch + prompt detection
 //! - `ui.rs`        — webview HTML/JS assets + string helpers
 
 mod environment;
 mod terminal;
 mod ui;
+mod updater;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};

@@ -6,7 +6,13 @@ set -euo pipefail
 APP_NAME="dsh-desktop"
 HUMAN_NAME="DeepSeek dsh Web"
 IDENTIFIER="com.dsh.desktop"
-VERSION="0.1.0"
+# Keep the bundle version in sync with the crate version (used by the
+# in-app update check).
+VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
+if [ -z "$VERSION" ]; then
+  echo "error: 无法从 Cargo.toml 读取版本号" >&2
+  exit 1
+fi
 ICON_PNG="icon/logo-480.png"
 ICNS="icon/AppIcon.icns"
 OUT="$APP_NAME.app"

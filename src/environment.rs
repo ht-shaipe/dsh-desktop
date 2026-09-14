@@ -34,6 +34,9 @@ pub fn run_environment_flow(
     let _ = proxy.send_event(UserEvent::Term("=== 启动前环境自检 ===\r\n".into()));
     let _ = proxy.send_event(UserEvent::Status("正在检查运行环境…".into()));
 
+    // --- 0. Self-update check (non-fatal; offline machines just skip) -----
+    crate::updater::check_and_apply(&proxy);
+
     // --- 1. Environment check -------------------------------------------
     let node = resolve_npx();
     // Decide whether the found npx is usable. If its Node is too old (the
@@ -102,7 +105,7 @@ pub fn run_environment_flow(
     let _ = proxy.send_event(UserEvent::Status("正在准备自动安装 Node.js 运行环境…".into()));
 
     let target = node_target();
-    let cache = match node_cache_dir() {
+    let cache = match cache_dir() {
         Ok(c) => c,
         Err(e) => {
             let _ = proxy.send_event(UserEvent::Fatal(e));
@@ -263,7 +266,7 @@ fn download_and_extract_node(
 }
 
 /// HEAD the URL and return its Content-Length, if available.
-fn http_content_length(url: &str) -> Option<u64> {
+pub(crate) fn http_content_length(url: &str) -> Option<u64> {
     let out = Command::new("curl")
         .args(["-sI", "--max-time", "20", url])
         .output()
@@ -420,8 +423,9 @@ fn node_target() -> String {
     format!("{}-{}", os, arch)
 }
 
-/// Local cache directory that holds the (optionally) downloaded portable Node.
-fn node_cache_dir() -> Result<PathBuf, String> {
+/// Local cache directory for app-managed downloads (portable Node, update
+/// packages). Shared with `updater.rs`.
+pub(crate) fn cache_dir() -> Result<PathBuf, String> {
     let base = if cfg!(windows) {
         std::env::var("LOCALAPPDATA")
             .unwrap_or_else(|_| "C:\\Users\\Public\\.cache".to_string())
