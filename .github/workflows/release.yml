@@ -1,7 +1,8 @@
 # 跨平台自动发版工作流
 #
-# 触发：仅在 GitHub 仓库的 Actions 页面手动运行（workflow_dispatch）。
-#   运行时会要求填写版本号（如 v0.2.0），该值即 Release 的 tag / 名称。
+# 触发方式:
+#   1. 手动触发（workflow_dispatch）- 在 Actions 页面手动运行，填写版本号
+#   2. Tag 推送（push tags）- 推送 v* 格式的标签自动触发
 #
 # 产物（均上传到同一个 GitHub Release）：
 #   - macOS  arm64 : dsh-desktop-macos-aarch64.dmg + .sig
@@ -24,12 +25,18 @@
 name: Release
 
 on:
+  # 方式一：手动触发
   workflow_dispatch:
     inputs:
       version:
         description: "Release 版本号 / tag，例如 v0.2.0"
         required: true
         default: "v0.1.0"
+  
+  # 方式二：推送 v* 标签时自动触发
+  push:
+    tags:
+      - 'v*'
 
 # 允许工作流创建 Release 与 tag
 permissions:
@@ -37,7 +44,7 @@ permissions:
 
 # 同一版本号只跑一个实例，避免重复发版
 concurrency:
-  group: release-${{ github.event.inputs.version }}
+  group: release-${{ github.event.inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -244,13 +251,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: ${{ github.event.inputs.version }}
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: ${{ github.event.inputs.version || github.ref_name }}
           files: out/*
           generate_release_notes: true
           make_latest: true
           body: |
-            ## dsh-desktop ${{ github.event.inputs.version }}
+            ## dsh-desktop ${{ github.event.inputs.version || github.ref_name }}
 
             跨平台构建（带签名验证）。
 
