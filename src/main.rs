@@ -697,7 +697,9 @@ fn setup_titlebar_accessory(webview: &wry::WebView, proxy: &tao::event_loop::Eve
         // --- Container ---
         let container: *mut AnyObject = objc2::msg_send![superclass, alloc];
         let container: *mut AnyObject = objc2::msg_send![container,
-            initWithFrame: ns_make_rect(0.0, 0.0, 148.0, 28.0)
+            // 宽度需容纳右侧版本号标签（x=110 起，60pt 约可显示 9 个字符，
+            // 覆盖 v0.1.13 / v0.1.100 之类的长度）
+            initWithFrame: ns_make_rect(0.0, 0.0, 170.0, 28.0)
         ];
 
         // --- "检查更新" NSButton ---
@@ -740,7 +742,8 @@ fn setup_titlebar_accessory(webview: &wry::WebView, proxy: &tao::event_loop::Eve
         let ns_text_cls = AnyClass::get(ns_text).unwrap();
         let ver_label: *mut AnyObject = objc2::msg_send![ns_text_cls, alloc];
         let ver_label: *mut AnyObject = objc2::msg_send![ver_label,
-            initWithFrame: ns_make_rect(110.0, 6.0, 38.0, 16.0)
+            // 38pt 只够显示 v0.1.1（7 字符的 v0.1.13 会被截断），放宽到 60pt
+            initWithFrame: ns_make_rect(110.0, 6.0, 60.0, 16.0)
         ];
         let ver_str: *mut AnyObject = objc2::msg_send![
             ns_str_cls, stringWithUTF8String: format!("v{}\0", version).as_ptr()
