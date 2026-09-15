@@ -669,7 +669,8 @@ fn start_command_pty(
                     }
                     // 窗口只保留最近 20 行
                     if recent_lines.len() > 20 {
-                        recent_lines.drain(..recent_lines.len() - 20);
+                        let drain_end = recent_lines.len() - 20;
+                        recent_lines.drain(..drain_end);
                     }
                     // 命令在请求 (y/N) 确认时：自动回答一次，
                     // 并把它问的原话展示出来。
@@ -781,7 +782,8 @@ fn spawn_reader(
                         let mut t = term_tail.lock().unwrap();
                         t.push(line.to_string());
                         if t.len() > TAIL_LINES {
-                            t.drain(..t.len() - TAIL_LINES);
+                            let tail_start = t.len() - TAIL_LINES;
+                            t.drain(..tail_start);
                         }
                     }
                     let _ = proxy.send_event(UserEvent::Term(chunk));
