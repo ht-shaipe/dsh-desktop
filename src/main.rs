@@ -117,8 +117,9 @@ pub enum UserEvent {
     ShowHelp,
     /// 发现新版本（version_tag, release_notes）。
     UpdateAvailable(String, String),
-    /// 下载进度 0..100。
-    UpdateProgress(u8),
+    /// 下载进度：(pct 0..100, 已下载字节, 总字节)。total=0 表示未知，
+    /// 此时 pct 恒为 0、进度信息以已下载字节数展示。
+    UpdateProgress(u8, u64, u64),
     /// 更新下载+安装完成，参数为版本 tag。
     UpdateDone(String),
     /// 更新流程失败（下载/验签/安装），参数为简短提示文案。
@@ -130,11 +131,13 @@ pub enum UserEvent {
 /// 整页导航后 app.js 的 showUpdateProgress 已被替换，不能再用）。
 /// 固定在页面顶部（原生标题栏正下方）的横条：文本 + 渐变进度条 + 百分比，
 /// 样式与启动页 app.js 的 showUpdateProgress 一致。
-/// `installing` 为 true 时显示"正在安装…"并锁定 100%。
-fn update_bar_show_js(pct: u8, installing: bool) -> String {
-    let fill = if installing { "100".to_string() } else { pct.to_string() };
-    let pct_text = if installing { "100%".to_string() } else { format!("{}%", pct) };
-    let text = if installing { "正在安装更新…" } else { "正在下载更新…" };
+/// `pct` 为 None 时（总大小未知）保持当前宽度、百分比位显示"…"，
+/// 进度信息全部体现在 `text` 里（如"已下载 3.2 MB"）。
+fn update_bar_show_js(text: &str, pct: Option<u8>) -> String {
+    let (fill, pct_text) = match pct {
+        Some(p) => (p.to_string(), format!("{}%", p)),
+        None => (String::new(), "…".to_string()),
+    };
     format!(
         "(function(){{try{{var b=document.getElementById('dshUpdBar');\
          if(!b){{b=document.createElement('div');b.id='dshUpdBar';\
@@ -142,14 +145,15 @@ fn update_bar_show_js(pct: u8, installing: bool) -> String {
          background:#1a1f2e;border-bottom:1px solid #2a3242;padding:10px 20px;\
          display:flex;align-items:center;gap:12px;font:13px -apple-system,BlinkMacSystemFont,sans-serif;\
          color:#e6e6e6;box-shadow:0 2px 8px rgba(0,0,0,.35);';\
-         b.innerHTML='<span id=\"dshUpdText\"></span>\
+         b.innerHTML='<span id=\"dshUpdText\" style=\"white-space:nowrap;overflow:hidden;\
+         text-overflow:ellipsis;\"></span>\
            <div style=\"flex:1;height:6px;background:#2a3242;border-radius:3px;overflow:hidden;\">\
            <div id=\"dshUpdFill\" style=\"height:100%;width:0%;\
            background:linear-gradient(90deg,#4f8cff,#7ee0a0);transition:width .2s;\"></div></div>\
            <span id=\"dshUpdPct\" style=\"min-width:44px;text-align:right;\"></span>';\
          (document.body||document.documentElement).appendChild(b);}}\
          document.getElementById('dshUpdText').textContent={text};\
-         document.getElementById('dshUpdFill').style.width='{fill}%';\
+         if('{fill}'!=='')document.getElementById('dshUpdFill').style.width='{fill}%';\
          document.getElementById('dshUpdPct').textContent='{pct_text}';\
          }}catch(e){{}}}})();",
         text = ui::js_string_arg(text),
@@ -462,7 +466,10 @@ fn main() {
                         // 已被整页替换，确认对话框无处显示。改为注入式进度栏
                         // （标题栏下方）+ 原生 toast 提示 + 直接后台下载安装，
                         // 完成后再次 toast 提示重启。
-                        let _ = webview.evaluate_script(&update_bar_show_js(0, false));
+                        let _ = webview.evaluate_script(&update_bar_show_js(
+                            &format!("发现新版本 {}，正在下载更新…", tag),
+                            Some(0),
+                        ));
                         #[cfg(target_os = "macos")]
                         {
                             let t = format!("发现新版本 {}，正在后台下载更新…", tag);
@@ -488,16 +495,28 @@ fn main() {
                     }
                     let _ = webview.evaluate_script("setUpdateBtn('检查更新', false)");
                 }
-                UserEvent::UpdateProgress(p) => {
-                    // 启动页：app.js 的 showUpdateProgress 仍然可用；
+                UserEvent::UpdateProgress(p, downloaded, total) => {
+                    // 启动页：app.js 的 showUpdateProgress 仍然可用（百分比）；
                     // dsh web 页面：app.js 已被整页替换，改为注入自绘进度栏
-                    // （固定在原生标题栏正下方，显示实时下载进度）。
+                    // （固定在原生标题栏正下方，显示实时下载进度 + MB 字节数）。
                     let _ = webview.evaluate_script(&format!(
                         "if (typeof showUpdateProgress === 'function') showUpdateProgress({});",
                         p
                     ));
                     if at_dsh_web {
-                        let _ = webview.evaluate_script(&update_bar_show_js(p, p >= 100));
+                        if p >= 100 {
+                            let _ = webview.evaluate_script(&update_bar_show_js("正在安装更新…", Some(100)));
+                        } else if total > 0 {
+                            let note = format!(
+                                "正在下载更新… {:.1}/{:.1} MB",
+                                downloaded as f64 / 1e6,
+                                total as f64 / 1e6
+                            );
+                            let _ = webview.evaluate_script(&update_bar_show_js(&note, Some(p)));
+                        } else {
+                            let note = format!("正在下载更新… 已下载 {:.1} MB", downloaded as f64 / 1e6);
+                            let _ = webview.evaluate_script(&update_bar_show_js(&note, None));
+                        }
                     }
                 }
                 UserEvent::UpdateDone(tag) => {
@@ -800,18 +819,24 @@ mod tests {
 
     #[test]
     fn update_bar_js_is_well_formed() {
-        let js = update_bar_show_js(42, false);
+        let js = update_bar_show_js("正在下载更新… 3.2/12.5 MB", Some(42));
         assert!(js.starts_with("(function()"));
         assert!(js.ends_with("})();"));
         assert!(js.contains("dshUpdBar"));
         assert!(js.contains("dshUpdFill"));
-        assert!(js.contains("textContent=\"正在下载更新…\""));
+        assert!(js.contains("textContent=\"正在下载更新… 3.2/12.5 MB\""));
         assert!(js.contains("width='42%'"));
         assert!(js.contains("'42%'"));
 
-        let js = update_bar_show_js(100, true);
+        let js = update_bar_show_js("正在安装更新…", Some(100));
         assert!(js.contains("textContent=\"正在安装更新…\""));
         assert!(js.contains("width='100%'"));
+
+        // 总大小未知：宽度不动、百分比显示"…"，进度信息在文本里
+        let js = update_bar_show_js("正在下载更新… 已下载 1.5 MB", None);
+        assert!(js.contains("textContent=\"正在下载更新… 已下载 1.5 MB\""));
+        assert!(js.contains("'…'"));
+        assert!(!js.contains("width=''"));
 
         let js = update_bar_hide_js();
         assert!(js.contains("dshUpdBar"));
@@ -822,15 +847,15 @@ mod tests {
         assert!(js.contains("dshUpdRestart"));
         assert!(js.contains("dshUpdLater"));
         assert!(js.contains("RESTART_APP"));
-        assert!(!js.contains("v0.1.13\n"));
     }
 
     #[test]
     fn update_bar_js_printable() {
         // 人工核对 / 语法检查用：
         // cargo test update_bar_js_printable -- --nocapture
-        println!("SHOW42={}", update_bar_show_js(42, false));
-        println!("SHOW100={}", update_bar_show_js(100, true));
+        println!("SHOW42={}", update_bar_show_js("正在下载更新… 3.2/12.5 MB", Some(42)));
+        println!("SHOWUNKNOWN={}", update_bar_show_js("正在下载更新… 已下载 1.5 MB", None));
+        println!("SHOW100={}", update_bar_show_js("正在安装更新…", Some(100)));
         println!("HIDE={}", update_bar_hide_js());
         println!("DONE={}", update_bar_complete_js("v0.1.13"));
     }

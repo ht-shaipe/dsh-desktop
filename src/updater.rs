@@ -8,23 +8,29 @@
 //! 发布的 tag（如 `v0.2.0`）保持一致。
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
+
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::StreamExt;
 use minisign_verify::{PublicKey, Signature};
 use tao::event_loop::EventLoopProxy;
 
 use crate::UserEvent;
-use crate::environment::http_content_length;
 
 /// 发布 Release 的 GitHub 仓库。
 const GITHUB_REPO: &str = "ht-shaipe/dsh-desktop";
 /// Release API 探测的超时时间，避免离线机器被卡住。
 const API_TIMEOUT_SECS: &str = "8";
+/// 下载失败后的最大重试次数（断点续传）。
+const MAX_DL_RETRIES: usize = 3;
+/// 单次 chunk 读取超过此时长无数据即视为网络停滞，中止本轮重试。
+/// 等价于 curl 的 `--speed-time/--speed-limit`，但粒度更精确（逐块超时）。
+const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 用于验证更新包签名的 minisign 公钥。
 /// 该公钥应内嵌在应用二进制中。
@@ -116,27 +122,31 @@ fn verify_signature(file_path: &Path, signature_content: &str) -> Result<(), Str
     Ok(())
 }
 
-/// 通过 curl 请求 `https://api.github.com/repos/<repo>/releases/latest`
-/// 并提取 `tag_name` 等字段。我们刻意不引入 HTTP/JSON 依赖：
-/// curl 在本应用支持的所有平台上都有预装（见 `environment.rs`），
-/// 而我们要取的字段只是一个稳定的简单字符串。
+/// 通过 reqwest 请求 `https://api.github.com/repos/<repo>/releases/latest`
+/// 并提取 `tag_name` 等字段。JSON 仍用手写极简提取（只取两个扁平字符串
+/// 字段，不值得为此引入 serde_json）。
 fn fetch_latest_release() -> Option<Release> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
-    let out = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            API_TIMEOUT_SECS,
-            "-H",
-            "Accept: application/vnd.github+json",
-            &url,
-        ])
-        .output()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&out.stdout);
+    let body = rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(API_TIMEOUT_SECS.parse().unwrap_or(8)))
+            .build()
+            .ok()?;
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.text().await.ok()
+    })?;
     let tag = json_string_field(&body, "tag_name")?;
     let version = parse_version(tag.trim().trim_start_matches('v'))?;
     let release_body = json_string_field(&body, "body").unwrap_or_default();
@@ -249,6 +259,160 @@ fn asset_name() -> String {
     }
 }
 
+/// 用 reqwest 流式下载 `url` 到 `pkg`，支持断点续传与停滞检测。
+///
+/// 每轮：发 `Range: bytes=<offset>-` 续传请求 → `bytes_stream()` 逐块读 →
+/// `tokio::time::timeout(STALL_TIMEOUT)` 包裹每个 chunk，超时即判定停滞，
+/// 保留已下载部分进入下一轮重试。返回总字节数（用于完成时的 100% 事件）。
+async fn download_with_retries(
+    url: &str,
+    pkg: &Path,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> Result<u64, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("构建客户端失败: {}", e))?;
+    // HEAD 探测总大小（跟随重定向；CDN 不支持 HEAD 时回退 0，进度按字节显示）
+    let total = match client.head(url).send().await {
+        Ok(r) if r.status().is_success() => r.content_length().unwrap_or(0),
+        _ => 0,
+    };
+
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_DL_RETRIES {
+        let offset = fs::metadata(pkg).map(|m| m.len()).unwrap_or(0);
+        let mut req = client.get(url);
+        if offset > 0 {
+            req = req.header("Range", format!("bytes={}-", offset));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("请求失败: {}", e);
+                if attempt < MAX_DL_RETRIES {
+                    emit_retry(proxy, attempt, offset, &last_err).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            last_err = format!("HTTP {}", status);
+            // 4xx 重试无意义
+            if (400..500).contains(&status.as_u16()) {
+                return Err(last_err);
+            }
+            if attempt < MAX_DL_RETRIES {
+                emit_retry(proxy, attempt, offset, &last_err).await;
+                continue;
+            }
+            return Err(last_err);
+        }
+        // 206 = 续传（append），200 = 服务器忽略 Range 全量重发（truncate）
+        let is_partial = status.as_u16() == 206;
+        let remaining = resp.content_length().unwrap_or(0);
+        let effective_total = if is_partial { offset + remaining } else { remaining };
+        let total = if total > 0 { total } else { effective_total };
+
+        let mut file = if is_partial {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pkg)
+                .map_err(|e| format!("打开文件失败: {}", e))?
+        } else {
+            std::fs::File::create(pkg).map_err(|e| format!("创建文件失败: {}", e))?
+        };
+
+        let mut stream = resp.bytes_stream();
+        let mut downloaded = offset;
+        let mut last_emit = Instant::now();
+        let mut last_emit_bytes = downloaded;
+        let mut stalled = false;
+        let mut read_err: Option<String> = None;
+        loop {
+            match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+                Err(_) => {
+                    stalled = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    read_err = Some(format!("读取失败: {}", e));
+                    break;
+                }
+                Ok(Some(Ok(bytes))) => {
+                    if let Err(e) = file.write_all(&bytes) {
+                        read_err = Some(format!("写入失败: {}", e));
+                        break;
+                    }
+                    downloaded += bytes.len() as u64;
+                    let now = Instant::now();
+                    if downloaded - last_emit_bytes >= 65536
+                        || now - last_emit >= Duration::from_millis(100)
+                    {
+                        last_emit = now;
+                        last_emit_bytes = downloaded;
+                        let pct = if total > 0 {
+                            ((downloaded as f64 / total as f64) * 100.0).min(99.0) as u8
+                        } else {
+                            0
+                        };
+                        let line = if total > 0 {
+                            format!(
+                                "  升级包下载进度 {:3}% ({:.1}/{:.1} MB)\r",
+                                pct,
+                                downloaded as f64 / 1e6,
+                                total as f64 / 1e6
+                            )
+                        } else {
+                            format!("  已下载 {:.1} MB\r", downloaded as f64 / 1e6)
+                        };
+                        let _ = proxy.send_event(UserEvent::Term(line));
+                        let _ = proxy.send_event(UserEvent::UpdateProgress(pct, downloaded, total));
+                    }
+                }
+            }
+        }
+        drop(file);
+
+        if stalled {
+            last_err = "网络停滞".into();
+        } else if let Some(e) = read_err {
+            last_err = e;
+        } else {
+            // 大小校验
+            let final_size = fs::metadata(pkg).map(|m| m.len()).unwrap_or(0);
+            if total > 0 && final_size != total {
+                last_err = format!("大小不匹配 {}/{}", final_size, total);
+            } else {
+                return Ok(total);
+            }
+        }
+        if attempt < MAX_DL_RETRIES {
+            let have = fs::metadata(pkg).map(|m| m.len()).unwrap_or(0);
+            emit_retry(proxy, attempt, have, &last_err).await;
+        }
+    }
+    Err(last_err)
+}
+
+/// 发送"下载中断，正在重试"的终端提示，并等待 2 秒后重连（避免立即重试
+/// 撞上同一个网络抖动）。
+async fn emit_retry(proxy: &EventLoopProxy<UserEvent>, attempt: usize, have: u64, reason: &str) {
+    let _ = proxy.send_event(UserEvent::Term(format!(
+        "  ⚠ 下载中断（{}），已保留 {:.1} MB，正在从断点重试（第 {}/{} 次）…\r\n",
+        reason,
+        have as f64 / 1e6,
+        attempt,
+        MAX_DL_RETRIES
+    )));
+    let _ = proxy.send_event(UserEvent::Term("\r\n".into()));
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+}
+
 /// 下载 `tag` 对应平台的安装包并安装，进度输出到终端。
 /// 失败只打印提示，绝不向上传播。
 pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
@@ -279,91 +443,67 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
     let pkg = cache.join(&name);
     let sig_pkg = cache.join(format!("{}.sig", name));
 
-    // --- 下载（与 Node 安装器相同的实时进度条样式） -----------------------
-    let _ = proxy.send_event(UserEvent::Term(format!(
-        "  正在下载 {} …\r\n",
-        name
-    )));
-    let total = http_content_length(&url).unwrap_or(0);
-    let mut dl = match Command::new("curl")
-        .args([
-            "-fsSL",
-            // 连接超时：GitHub 直连在部分网络环境下不可达，
-            // 20 秒内连不上就快速失败给出提示，避免长时间"无动静"。
-            "--connect-timeout",
-            "20",
-            "--max-time",
-            "600",
-            &url,
-            "-o",
-            &pkg.to_string_lossy(),
-        ])
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = proxy.send_event(UserEvent::UpdateFailed("无法启动下载".into()));
-            let _ = proxy.send_event(UserEvent::Term(format!("  ✗ 下载失败：{}\r\n", e)));
+    // --- 下载（Rust 原生 reqwest，流式 + 停滞检测 + 断点续传重试） ----------
+    // 用 bytes_stream() 逐块读取响应体，每块用 tokio::time::timeout 包裹：
+    // 超过 STALL_TIMEOUT 无新数据即判定网络停滞，中止本轮并从断点重试
+    // （等价于 curl 的 --speed-time/--speed-limit，但粒度精确到单块）。
+    // 失败时保留已下载部分，下一轮发 Range: bytes=<offset>- 续传。
+    let _ = proxy.send_event(UserEvent::Term(format!("  正在下载 {} …\r\n", name)));
+    let dl_result = {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = proxy.send_event(UserEvent::UpdateFailed(format!("初始化运行时失败: {}", e)));
+                let _ = proxy.send_event(UserEvent::Term(format!("  ✗ 下载失败：{}\r\n", e)));
+                return;
+            }
+        };
+        rt.block_on(download_with_retries(&url, &pkg, &proxy))
+    };
+    match dl_result {
+        Ok(total) => {
+            let _ = proxy.send_event(UserEvent::UpdateProgress(100, total, total));
+            let _ = proxy.send_event(UserEvent::Term("\r\n".into()));
+            let _ = proxy.send_event(UserEvent::Term("  ✓ 下载完成，正在验证签名…\r\n".into()));
+        }
+        Err(msg) => {
+            let _ = fs::remove_file(&pkg);
+            let _ = proxy.send_event(UserEvent::UpdateFailed("下载失败，已跳过本次升级".into()));
+            let _ = proxy.send_event(UserEvent::Term(format!(
+                "  ✗ 升级包下载失败（{}）。{}本次跳过升级，不影响使用。\r\n",
+                url, msg
+            )));
             return;
         }
-    };
-    // 轮询文件大小刷新进度行
-    let mut last_pct: i32 = -1;
-    loop {
-        if let Ok(m) = fs::metadata(&pkg) {
-            let pct = if total > 0 {
-                ((m.len() as f64 / total as f64) * 100.0) as i32
-            } else {
-                -1
-            };
-            if pct != last_pct {
-                last_pct = pct;
-                let line = if pct >= 0 {
-                    format!("  升级包下载进度 {:3}%\r", pct.min(99))
-                } else {
-                    "  升级包下载中…\r".to_string()
-                };
-                let _ = proxy.send_event(UserEvent::Term(line));
-                // 同步驱动更新进度条 UI（顶部横条 / 状态提示）。
-                if pct >= 0 {
-                    let _ = proxy.send_event(UserEvent::UpdateProgress(pct.clamp(0, 99) as u8));
-                }
-            }
-        }
-        if dl.try_wait().ok().flatten().is_some() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
     }
-    let ok = dl.wait().ok().map(|s| s.success()) == Some(true) && pkg.is_file();
-    if !ok {
-        let _ = fs::remove_file(&pkg);
-        let _ = proxy.send_event(UserEvent::UpdateFailed("下载失败，已跳过本次升级".into()));
-        let _ = proxy.send_event(UserEvent::Term(format!(
-            "  ✗ 升级包下载失败（{}）。本次跳过升级，不影响使用。\r\n",
-            url
-        )));
-        return;
-    }
-    let _ = proxy.send_event(UserEvent::UpdateProgress(100));
-    let _ = proxy.send_event(UserEvent::Term("\r\n".into()));
-    let _ = proxy.send_event(UserEvent::Term("  ✓ 下载完成，正在验证签名…\r\n".into()));
 
     // --- 验证签名 ---------------------------------------------------------
-    let sig_downloaded = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "20",
-            "--max-time",
-            "30",
-            &sig_url,
-            "-o",
-            &sig_pkg.to_string_lossy(),
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // 签名文件是小文本，直接用 reqwest 拉取整个 body 写入文件。
+    let sig_downloaded = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+        rt.and_then(|rt| {
+            rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(20))
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .ok()?;
+                let resp = client.get(&sig_url).send().await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let bytes = resp.bytes().await.ok()?;
+                fs::write(&sig_pkg, &bytes).ok()
+            })
+        })
+        .is_some()
+    };
 
     if !sig_downloaded || !sig_pkg.is_file() {
         let _ = fs::remove_file(&pkg);
@@ -646,6 +786,43 @@ fn install_windows(_pkg: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 端到端验证 reqwest 的 Range 续传 + tokio::time::timeout 停滞检测。
+    /// 需要本地服务器配合，手动跑：
+    ///   bun -e 'const f=new Uint8Array(8*1024*1024); ...'  # 见验证脚本
+    ///   cargo test reqwest_range_and_stall -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn reqwest_range_and_stall() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::builder().build().unwrap();
+
+            // 1) Range 续传：请求 bytes=3000000-，期望 206 + 剩余字节
+            let resp = client
+                .get("http://127.0.0.1:18925/f")
+                .header("Range", "bytes=3000000-")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                206,
+                "支持 Range 的服务器应返回 206 Partial Content"
+            );
+            let bytes = resp.bytes().await.unwrap();
+            assert_eq!(bytes.len(), 8388608 - 3000000, "续传返回剩余字节");
+
+            // 2) 停滞检测：慢端点 5s 才发数据，2s timeout 应超时
+            let resp = client.get("http://127.0.0.1:18925/slow").send().await.unwrap();
+            let mut stream = resp.bytes_stream();
+            let r = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+            assert!(r.is_err(), "超过 timeout 无数据应判定为停滞");
+        });
+    }
 
     #[test]
     fn parses_versions() {

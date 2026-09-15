@@ -10,6 +10,14 @@ libc = "0.2"
 png = "0.17"
 minisign-verify = "0.2.5"
 base64 = "0.22"
+# 自动更新下载：用 Rust 原生 HTTP 客户端替代 curl 子进程。
+# - reqwest: async HTTP，stream feature 启用 bytes_stream() 做流式下载
+# - rustls-tls: 纯 Rust TLS，无 OpenSSL 系统依赖
+# - tokio: 单独的 current_thread runtime（apply_update 在后台线程里 block_on）
+# - futures-util: bytes_stream 的 StreamExt::next
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+futures-util = "0.3"
 
 # On macOS we build a tiny native Edit menu (Cut/Copy/Paste/Select All/Undo/
 # Redo) so that ⌘V (and friends) are routed by AppKit into the webview's input
