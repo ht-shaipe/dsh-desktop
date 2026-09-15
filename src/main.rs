@@ -164,6 +164,37 @@ fn update_bar_hide_js() -> String {
         .to_string()
 }
 
+/// dsh web 页面上的"更新完成"横条：复用进度栏的位置（dshUpdBar），
+/// 内容替换为绿色完成条 + "立即重启"/"稍后"按钮。
+/// "立即重启"走 `RESTART_APP` IPC（webview 级通道，跨页面导航仍有效）；
+/// 若页面上下文里 `window.ipc` 意外不可用，点击静默无效，用户仍可手动重启。
+fn update_bar_complete_js(tag: &str) -> String {
+    let ver = tag.trim_start_matches('v');
+    format!(
+        "(function(){{try{{var b=document.getElementById('dshUpdBar');\
+         if(!b){{b=document.createElement('div');b.id='dshUpdBar';\
+         b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;\
+         background:#1a2332;border-bottom:1px solid #2f7d4f;padding:10px 20px;\
+         display:flex;align-items:center;gap:12px;font:13px -apple-system,BlinkMacSystemFont,sans-serif;\
+         color:#e6e6e6;box-shadow:0 2px 8px rgba(0,0,0,.35);';\
+         (document.body||document.documentElement).appendChild(b);}}\
+         b.innerHTML='<span id=\"dshUpdDoneText\" style=\"flex:1;\"></span>\
+           <button id=\"dshUpdRestart\" style=\"flex:0 0 auto;cursor:pointer;border:none;\
+           background:#4f8cff;color:#fff;border-radius:6px;padding:4px 14px;\
+           font:13px -apple-system,BlinkMacSystemFont,sans-serif;\">立即重启</button>\
+           <button id=\"dshUpdLater\" style=\"flex:0 0 auto;cursor:pointer;\
+           background:transparent;color:#8b93a3;border:1px solid #3a4252;border-radius:6px;\
+           padding:4px 14px;font:13px -apple-system,BlinkMacSystemFont,sans-serif;\">稍后</button>';\
+         document.getElementById('dshUpdDoneText').textContent={text};\
+         document.getElementById('dshUpdRestart').onclick=function(){{\
+           try{{window.ipc.postMessage('RESTART_APP');}}catch(e){{}}}};\
+         document.getElementById('dshUpdLater').onclick=function(){{\
+           try{{b.remove();}}catch(e){{}}}};\
+         }}catch(e){{}}}})();",
+        text = ui::js_string_arg(&format!("✓ 已升级到 v{}，重启应用完成更新", ver)),
+    )
+}
+
 /// 显示一个原生浮动提示窗口，2 秒后自动消失。
 #[cfg(target_os = "macos")]
 fn show_native_toast(text: &str) {
@@ -476,18 +507,10 @@ fn main() {
                         #[cfg(not(target_os = "macos"))]
                         let _ = webview.evaluate_script("showUpdateToast('已是最新版本')");
                     } else if at_dsh_web {
-                        // dsh 界面：先收起注入式进度栏，再用原生 toast 提示重启。
-                        let _ = webview.evaluate_script(&update_bar_hide_js());
-                        #[cfg(target_os = "macos")]
-                        {
-                            let t = format!("已升级到 {}，重启应用后生效", tag);
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast(&t)));
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        let _ = webview.evaluate_script(&format!(
-                            "if (typeof showUpdateToast === 'function') showUpdateToast('已升级到 {}，重启应用后生效')",
-                            tag
-                        ));
+                        // dsh 界面：注入"更新完成"横条（带"立即重启"按钮）。
+                        // 重启是需要用户明确行动的提示，原生 toast 2 秒即逝
+                        // 容易错过，非 macOS 上 showUpdateToast 则根本不存在。
+                        let _ = webview.evaluate_script(&update_bar_complete_js(&tag));
                     } else {
                         // 启动页：显示完成对话框（含"立即重启"按钮）。
                         let _ = webview.evaluate_script(&format!(
@@ -793,6 +816,13 @@ mod tests {
         let js = update_bar_hide_js();
         assert!(js.contains("dshUpdBar"));
         assert!(js.contains(".remove()"));
+
+        let js = update_bar_complete_js("v0.1.13");
+        assert!(js.contains("textContent=\"✓ 已升级到 v0.1.13，重启应用完成更新\""));
+        assert!(js.contains("dshUpdRestart"));
+        assert!(js.contains("dshUpdLater"));
+        assert!(js.contains("RESTART_APP"));
+        assert!(!js.contains("v0.1.13\n"));
     }
 
     #[test]
@@ -802,5 +832,6 @@ mod tests {
         println!("SHOW42={}", update_bar_show_js(42, false));
         println!("SHOW100={}", update_bar_show_js(100, true));
         println!("HIDE={}", update_bar_hide_js());
+        println!("DONE={}", update_bar_complete_js("v0.1.13"));
     }
 }
