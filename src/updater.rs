@@ -133,6 +133,8 @@ fn fetch_latest_release() -> Option<Release> {
         .ok()?;
     let body = rt.block_on(async {
         let client = reqwest::Client::builder()
+            // GitHub API 拒绝不带 User-Agent 的请求（403），reqwest 默认不发 UA。
+            .user_agent(concat!("dsh-desktop/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(API_TIMEOUT_SECS.parse().unwrap_or(8)))
             .build()
             .ok()?;
@@ -270,6 +272,7 @@ async fn download_with_retries(
     proxy: &EventLoopProxy<UserEvent>,
 ) -> Result<u64, String> {
     let client = reqwest::Client::builder()
+        .user_agent(concat!("dsh-desktop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(600))
         .build()
@@ -490,6 +493,7 @@ pub fn apply_update(tag: &str, proxy: &EventLoopProxy<UserEvent>) {
         rt.and_then(|rt| {
             rt.block_on(async {
                 let client = reqwest::Client::builder()
+                    .user_agent(concat!("dsh-desktop/", env!("CARGO_PKG_VERSION")))
                     .connect_timeout(Duration::from_secs(20))
                     .timeout(Duration::from_secs(30))
                     .build()
