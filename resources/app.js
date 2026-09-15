@@ -298,6 +298,69 @@
     return d.textContent || d.innerText || '';
   }
 
+  // ==================== Startup auto-recovery diagnostics ====================
+  // Amber banner (distinct from the red fatal one): shows which plugins failed,
+  // what dsh-desktop did about it (disable & retry / safe mode / recovered),
+  // and how to restore a plugin. Payload shape (built in Rust, recovery.rs):
+  // { action: 'retry-disabled'|'safe-mode'|'recovered'|'failed',
+  //   attempt: 2, plugins: [{ id, module, reason }], note: '...' }
+  function showDiagnosis(d) {
+    if (!d) return;
+    var wrap = document.getElementById('termWrap');
+    if (!wrap) return;
+    var banner = document.getElementById('diagBanner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'diagBanner';
+      banner.style.cssText = 'background:#33270f;border:1px solid #8a6a24;color:#ffd98a;padding:10px 14px;border-radius:8px;font-size:13px;line-height:1.7;margin-bottom:8px;text-align:left;';
+      var head = document.createElement('div');
+      head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;';
+      var title = document.createElement('div');
+      title.style.cssText = 'font-weight:600;white-space:pre-wrap;';
+      title.id = 'diagTitle';
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕';
+      closeBtn.title = '关闭此提示';
+      closeBtn.style.cssText = 'flex:0 0 auto;cursor:pointer;background:transparent;color:#ffd98a;border:1px solid #8a6a24;border-radius:6px;padding:2px 10px;font:12px inherit;';
+      closeBtn.onclick = function () { banner.style.display = 'none'; };
+      head.appendChild(title);
+      head.appendChild(closeBtn);
+      var body = document.createElement('div');
+      body.id = 'diagBody';
+      body.style.cssText = 'margin-top:6px;white-space:pre-wrap;';
+      banner.appendChild(head);
+      banner.appendChild(body);
+      wrap.insertBefore(banner, wrap.firstChild);
+    }
+    banner.style.display = 'block';
+
+    var titles = {
+      'retry-disabled': '⚠ 检测到故障插件，已自动禁用并重启（第 ' + d.attempt + ' 次失败后）',
+      'safe-mode': '⚠ 仍无法启动，已进入安全模式（停用全部第三方插件）重试',
+      'recovered': '✓ 自动修复成功 —— 应用已恢复启动',
+      'failed': '✗ 自动修复未能恢复启动'
+    };
+    var t = document.getElementById('diagTitle');
+    t.textContent = titles[d.action] || '启动诊断';
+    t.style.color = (d.action === 'recovered') ? '#7ee0a0' : (d.action === 'failed' ? '#ff9c9c' : '#ffd98a');
+
+    var html = '';
+    if (d.plugins && d.plugins.length) {
+      html += '已禁用/停用的插件：\n';
+      for (var i = 0; i < d.plugins.length; i++) {
+        var p = d.plugins[i];
+        html += '  • ' + p.id + (p.module ? '（' + p.module + '）' : '') + '\n';
+        if (p.reason) html += '      原因: ' + p.reason + '\n';
+      }
+      html += '\n';
+    }
+    if (d.note) html += escHtml(d.note) + '\n';
+    if (d.action !== 'recovered') {
+      html += '恢复插件：编辑 ~/.dsh/profiles/web/cordis.patch.yml，删除标记为 dsh-desktop auto-recovery 的条目后重启应用。';
+    }
+    document.getElementById('diagBody').textContent = html;
+  }
+
   var terminalShown = false;
   function showTerminal() {
     if (terminalShown) return;          // idempotent: never double-bind / double-header

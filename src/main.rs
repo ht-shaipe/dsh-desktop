@@ -7,9 +7,11 @@
 //! - `environment.rs` —— 环境自检 + 便携版 Node.js 自动安装
 //! - `updater.rs`     —— 基于 GitHub Releases 的应用自更新
 //! - `terminal.rs`    —— PTY/管道方式启动命令 + 交互提示检测
+//! - `recovery.rs`    —— 启动失败自动恢复（禁用故障插件重试 / 安全模式）
 //! - `ui.rs`          —— WebView 的 HTML/JS 资源 + 字符串工具
 
 mod environment;
+mod recovery;
 mod terminal;
 mod ui;
 mod updater;
@@ -61,7 +63,7 @@ pub struct ServerHandle {
 impl ServerHandle {
     /// 结束服务进程。Unix 上按进程组发送 SIGKILL（npx 会派生子进程，
     /// 只杀主进程会留下孤儿进程占用端口）；Windows 上直接杀子进程。
-    fn kill(&mut self) {
+    pub(crate) fn kill(&mut self) {
         #[cfg(unix)]
         unsafe {
             libc::killpg(self.pid as i32, libc::SIGKILL);
@@ -102,6 +104,11 @@ pub enum UserEvent {
     ServerReady(String),
     /// 致命错误 —— 直接展示在窗口中。
     Fatal(String),
+    /// 启动失败的自动修复诊断（JSON 载荷，见 recovery.rs 的 diag_json）：
+    /// 故障插件列表、当前动作（禁用重试/安全模式/修复成功/修复失败）。
+    Diagnosis(String),
+    /// 页面已进入 dsh web 后需要弹出的恢复提示（原生 DOM toast）。
+    RecoveredToast(String),
     /// 用户点击了"检查更新"按钮。
     CheckUpdate,
     /// 用户点击了"帮助"按钮：打开独立的帮助/关于窗口。
@@ -213,7 +220,6 @@ fn main() {
     let handle: Arc<Mutex<Option<ServerHandle>>> = Arc::new(Mutex::new(None));
     let input_writer: InputSink = Arc::new(Mutex::new(None));
     let user_took_over = Arc::new(AtomicBool::new(false));
-    let exited = Arc::new(AtomicBool::new(false));
 
     // WebView 先展示 加载中/检查清单 UI，随后切换到终端视图，
     // 用户可以在终端里观看进度并与安装过程交互。
@@ -261,10 +267,9 @@ fn main() {
     let bg_handle = handle.clone();
     let bg_input = input_writer.clone();
     let bg_took = user_took_over.clone();
-    let bg_exited = exited.clone();
     let ui_proxy = proxy.clone();
     thread::spawn(move || {
-        environment::run_environment_flow(ui_proxy, bg_handle, bg_input, bg_took, bg_exited);
+        environment::run_environment_flow(ui_proxy, bg_handle, bg_input, bg_took);
     });
 
     // 主窗口 id：用于区分"关闭主窗口（退出应用）"与"关闭帮助窗口（仅销毁该窗口）"。
@@ -346,6 +351,25 @@ fn main() {
                     // 保留交互式终端画面，只叠加一条红色错误横幅（带最后几行输出），
                     // 而不是清空整个页面 —— 用户需要看到究竟发生了什么。
                     let _ = webview.evaluate_script(&format!("showFatal({})", ui::js_string_arg(&msg)));
+                }
+                UserEvent::Diagnosis(payload) => {
+                    // 启动自动修复的诊断信息（琥珀色横幅，区别于致命错误）。
+                    let _ = webview.evaluate_script(&format!("showDiagnosis({})", payload));
+                }
+                UserEvent::RecoveredToast(msg) => {
+                    // 主页面已经是 dsh web 界面：注入一个原生 DOM toast
+                    // 提醒用户有插件被自动禁用。页面 CSP 不影响
+                    // evaluate_script；失败也无需反馈。
+                    let _ = webview.evaluate_script(&format!(
+                        "(function(){{try{{var d=document.createElement('div');d.textContent={};\
+                         d.style.cssText='position:fixed;top:16px;right:16px;z-index:2147483647;\
+                         max-width:420px;background:#1a2332;color:#7ee0a0;border:1px solid #3a4252;\
+                         border-radius:8px;padding:10px 16px;font:13px -apple-system,sans-serif;\
+                         box-shadow:0 4px 12px rgba(0,0,0,.4);';document.body.appendChild(d);\
+                         setTimeout(function(){{d.style.opacity='0';d.style.transition='opacity .4s';}},8000);\
+                         setTimeout(function(){{d.remove();}},8500);}}catch(e){{}}}})();",
+                        ui::js_string_arg(&msg)
+                    ));
                 }
                 UserEvent::CheckUpdate => {
                     let _ = webview.evaluate_script("setUpdateBtn('检查中…', true)");

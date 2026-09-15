@@ -16,16 +16,16 @@ use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
 
 use crate::{InputSink, ServerHandle, UserEvent};
-use crate::terminal::launch_terminal;
+use crate::recovery::launch_with_recovery;
 
 /// 完整的启动流程：检查运行环境、列出缺失项、
 /// 必要时自动安装 Node.js，然后在交互式终端中启动服务。
+/// 启动失败时由 `recovery` 模块自动诊断并修复（禁用故障插件重试）。
 pub fn run_environment_flow(
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
     user_took_over: Arc<AtomicBool>,
-    exited: Arc<AtomicBool>,
 ) {
     // 立即切换到交互式终端视图，让整个启动过程 —— 环境自检、自动安装、
     // 命令自身的输出 —— 读起来就像一次完整的 shell 会话。
@@ -95,7 +95,7 @@ pub fn run_environment_flow(
     // --- 2. 快速路径：本机已有可用的 Node ---------------------------------
     if let Some(npx) = usable_npx {
         let _ = proxy.send_event(UserEvent::Term("✓ 运行环境就绪，准备启动服务…\r\n".into()));
-        launch_terminal(npx, proxy, handle, input_writer, user_took_over, exited);
+        launch_with_recovery(npx, proxy, handle, input_writer, user_took_over);
         return;
     }
 
@@ -130,7 +130,7 @@ pub fn run_environment_flow(
             "✓ 已安装 Node.js: {}\r\n",
             npx.display()
         )));
-        launch_terminal(npx, proxy, handle, input_writer, user_took_over, exited);
+        launch_with_recovery(npx, proxy, handle, input_writer, user_took_over);
     } else {
         let _ = proxy.send_event(UserEvent::Fatal(
             "未能在自动安装的 Node.js 中找到 npx，安装失败。".into(),

@@ -23,6 +23,18 @@ use std::process::{Child, Stdio};
 use tao::event_loop::EventLoopProxy;
 
 use crate::{ARGS, POLL_ADDR, TARGET_URL, InputSink, ServerHandle, UserEvent};
+use crate::recovery::TAIL_LINES;
+
+/// 一次 `launch_terminal` 的结局，由自动恢复流程（`recovery.rs`）消费：
+/// 决定是正常结束、重试，还是彻底放弃。
+pub enum LaunchOutcome {
+    /// 服务端口已就绪，webview 已被导航（ServerReady 事件已发送）。
+    Ready,
+    /// 进程在端口就绪前退出（`crashed: true`）或等待超时（`crashed: false`）。
+    Failed { crashed: bool },
+    /// 已发生无法自动恢复的致命错误（Fatal 事件已发送），调用方应停止重试。
+    Abort,
+}
 
 /// 追加式调试日志，用于排查启动/认证问题；任何线程都能安全调用，
 /// 且绝不 panic。放在 /tmp 下方便用户分享。
@@ -61,6 +73,10 @@ impl Write for FdWriter {
 
 /// 在应用内交互式终端中启动 `npx -y @deepseek-ai/dsh web`，
 /// 把输出流式回传给 UI，并等待 `127.0.0.1:3080` 就绪。
+///
+/// `extra_args` 会插入到 dsh 启动器自己的 flags 之后、`--no-open` 之前
+/// （例如安全模式的 `--patch <file>`）；`term_tail` 用于保留本次尝试的
+/// 纯文本输出尾巴，供失败后诊断故障插件使用。
 pub fn launch_terminal(
     npx: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
@@ -68,8 +84,20 @@ pub fn launch_terminal(
     input_writer: InputSink,
     user_took_over: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
-) {
-    let cmd = format!("{} {}", npx.display(), ARGS.join(" "));
+    term_tail: Arc<Mutex<Vec<String>>>,
+    extra_args: &[String],
+) -> LaunchOutcome {
+    // dsh 启动器只认出现在首个未知 token 之前的自己的 flags，所以
+    // `--patch` 之类的启动器参数必须放在 `--no-open`（应用层参数）之前。
+    let mut args: Vec<String> = ARGS.iter().map(|s| s.to_string()).collect();
+    if let Some(pos) = args.iter().position(|a| a == "--no-open") {
+        for (i, a) in extra_args.iter().enumerate() {
+            args.insert(pos + i, a.clone());
+        }
+    } else {
+        args.extend(extra_args.iter().cloned());
+    }
+    let cmd = format!("{} {}", npx.display(), args.join(" "));
     dbg_log(&format!("LAUNCH: {}", cmd));
     // 与读取线程、服务轮询线程共享的"最近活动"时间戳。npm 静默下载
     // 依赖期间（CI/非 TTY 模式会抑制其进度输出），用它来展示
@@ -91,13 +119,14 @@ pub fn launch_terminal(
     // 以前这只会表现为一个莫名其妙的 5 分钟超时。
     #[cfg(unix)]
     if ensure_port_free(&proxy).is_err() {
-        return;
+        return LaunchOutcome::Abort;
     }
 
     // Unix 走 PTY，Windows 走管道
     #[cfg(unix)]
     let started = start_command_pty(
         &npx,
+        &args,
         proxy.clone(),
         handle.clone(),
         input_writer.clone(),
@@ -105,10 +134,12 @@ pub fn launch_terminal(
         exited.clone(),
         last_term.clone(),
         server_url.clone(),
+        term_tail.clone(),
     );
     #[cfg(windows)]
     let started = start_command_piped(
         &npx,
+        &args,
         proxy.clone(),
         handle.clone(),
         input_writer.clone(),
@@ -116,6 +147,7 @@ pub fn launch_terminal(
         exited.clone(),
         last_term.clone(),
         server_url.clone(),
+        term_tail.clone(),
     );
 
     match started {
@@ -124,10 +156,11 @@ pub fn launch_terminal(
             // 回显将要执行的命令，让终端读起来像真实的 shell。
             *last_term.lock().unwrap() = Instant::now();
             let _ = proxy.send_event(UserEvent::Term(format!("\r\n$ {}\r\n", cmd)));
-            wait_for_server(proxy, handle, exited, last_term, server_url);
+            wait_for_server(proxy, handle, exited, last_term, server_url)
         }
         Err(e) => {
             let _ = proxy.send_event(UserEvent::Fatal(format!("启动命令失败: {}", e)));
+            LaunchOutcome::Abort
         }
     }
 }
@@ -186,6 +219,7 @@ fn ensure_port_free(_proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
 
 /// 轮询服务端口（无硬性超时），直到服务就绪、进程退出，或到达一个
 /// 比较宽裕的上限为止 —— 用户全程可以在终端里查看/响应。
+/// 返回结局给自动恢复流程决定后续（重试 / 放弃），不再直接发 Fatal。
 #[allow(unused_variables)]
 fn wait_for_server(
     proxy: EventLoopProxy<UserEvent>,
@@ -193,7 +227,7 @@ fn wait_for_server(
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
     server_url: Arc<Mutex<Option<String>>>,
-) {
+) -> LaunchOutcome {
     let mut ready = false;
     let mut last_beat: Option<Instant> = None;
     for _ in 0..1200 {
@@ -283,13 +317,11 @@ fn wait_for_server(
         dbg_log(&format!("NAVIGATE: {}", url));
         let _ = proxy.send_event(UserEvent::Status(format!("正在打开页面: {}", url)));
         let _ = proxy.send_event(UserEvent::ServerReady(url));
+        LaunchOutcome::Ready
     } else {
-        let msg = if exited.load(Ordering::SeqCst) {
-            "命令已退出，但 127.0.0.1:3080 未就绪。请查看上方终端输出，按需输入指令后重启应用重试。"
-        } else {
-            "命令运行超过 10 分钟仍未监听 127.0.0.1:3080。请查看上方终端输出，必要时输入指令继续；若端口被占用，请先结束占用 3080 的进程再试。"
-        };
-        let _ = proxy.send_event(UserEvent::Fatal(msg.into()));
+        let crashed = exited.load(Ordering::SeqCst);
+        dbg_log(&format!("WAIT_FAILED crashed={}", crashed));
+        LaunchOutcome::Failed { crashed }
     }
 }
 
@@ -456,6 +488,7 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(unix)]
 fn start_command_pty(
     npx: &Path,
+    args: &[String],
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
@@ -463,6 +496,7 @@ fn start_command_pty(
     exited: Arc<AtomicBool>,
     last_term: Arc<Mutex<Instant>>,
     server_url: Arc<Mutex<Option<String>>>,
+    term_tail: Arc<Mutex<Vec<String>>>,
 ) -> io::Result<()> {
     use std::ptr;
     use std::os::unix::ffi::OsStrExt as _;
@@ -476,7 +510,7 @@ fn start_command_pty(
     let cpath = cz(npx.as_os_str().as_bytes())?;
     let mut cstrings: Vec<CString> = vec![cpath];
     let mut argv: Vec<*const libc::c_char> = vec![cstrings[0].as_ptr()];
-    for a in ARGS {
+    for a in args {
         let cs = cz(a.as_bytes())?;
         argv.push(cs.as_ptr());
         cstrings.push(cs);
@@ -558,6 +592,7 @@ fn start_command_pty(
         let rauto_took = user_took_over.clone();
         let rlast = last_term.clone();
         let rurl = server_url.clone();
+        let rtail = term_tail.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             // 累积原始字节：跨两次读取被拆开的多字节 UTF-8 字符
@@ -615,6 +650,16 @@ fn start_command_pty(
                         }
                         dbg_log(&format!("LINE: {}", line));
                         recent_lines.push(line.clone());
+                        // 同时保留一份更长的纯文本尾巴（覆盖整个失败现场），
+                        // 供启动失败后诊断故障插件使用。
+                        {
+                            let mut t = rtail.lock().unwrap();
+                            t.push(line.clone());
+                            if t.len() > TAIL_LINES {
+                                let cut = t.len() - TAIL_LINES;
+                                t.drain(..cut);
+                            }
+                        }
                         // 解析 `dsh web: http://127.0.0.1:3080?token=…`
                         // 打印出来的带认证 URL，让 webview 跳转到它，
                         // 而不是裸端口（裸端口会是空白页）。
@@ -650,6 +695,18 @@ fn start_command_pty(
                 }
             }
             // PTY 读到了 EOF：子进程已退出。
+            // 先把 line_buf 里没有换行符结尾的残留行（崩溃现场的最后一行
+            // 往往如此）补进诊断尾巴，再标记退出。
+            if !line_buf.trim().is_empty() {
+                let leftover = line_buf.trim().to_string();
+                dbg_log(&format!("LINE: {}", leftover));
+                let mut t = rtail.lock().unwrap();
+                t.push(leftover);
+                if t.len() > TAIL_LINES {
+                    let cut = t.len() - TAIL_LINES;
+                    t.drain(..cut);
+                }
+            }
             dbg_log("READER_EXIT");
             rexit.store(true, Ordering::SeqCst);
             let _ = rproxy.send_event(UserEvent::TermDone("进程已退出".into()));
@@ -663,13 +720,15 @@ fn start_command_pty(
 #[cfg(windows)]
 fn start_command_piped(
     npx: &Path,
+    args: &[String],
     proxy: EventLoopProxy<UserEvent>,
     handle: Arc<Mutex<Option<ServerHandle>>>,
     input_writer: InputSink,
     _user_took_over: Arc<AtomicBool>,
-    _exited: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
     _last_term: Arc<Mutex<Instant>>,
     server_url: Arc<Mutex<Option<String>>>,
+    term_tail: Arc<Mutex<Vec<String>>>,
 ) -> io::Result<()> {
     // 把 npx 所在目录前置到 PATH（Windows 用分号分隔）
     let npx_dir = npx.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -678,7 +737,7 @@ fn start_command_piped(
 
     // Windows 没有 forkpty，用管道方式启动
     let mut child = Command::new(npx)
-        .args(ARGS)
+        .args(args)
         .env("PATH", new_path)
         .env("NODE_OPTIONS", filter_node_options())
         .env("npm_config_yes", "true")
@@ -695,13 +754,18 @@ fn start_command_piped(
     *handle.lock().unwrap() = Some(ServerHandle { child });
 
     // stdout / stderr 各起一个读取线程
-    spawn_reader(stdout, proxy.clone(), server_url.clone());
-    spawn_reader(stderr, proxy.clone(), server_url);
+    spawn_reader(stdout, proxy.clone(), server_url.clone(), term_tail.clone());
+    spawn_reader(stderr, proxy.clone(), server_url, term_tail);
     Ok(())
 }
 
 #[cfg(windows)]
-fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProxy<UserEvent>, server_url: Arc<Mutex<Option<String>>>) {
+fn spawn_reader(
+    mut stream: impl io::Read + Send + 'static,
+    proxy: EventLoopProxy<UserEvent>,
+    server_url: Arc<Mutex<Option<String>>>,
+    term_tail: Arc<Mutex<Vec<String>>>,
+) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -713,6 +777,11 @@ fn spawn_reader(mut stream: impl io::Read + Send + 'static, proxy: EventLoopProx
                     for line in plain.lines() {
                         if let Some(url) = parse_server_url(line) {
                             *server_url.lock().unwrap() = Some(url);
+                        }
+                        let mut t = term_tail.lock().unwrap();
+                        t.push(line.to_string());
+                        if t.len() > TAIL_LINES {
+                            t.drain(..t.len() - TAIL_LINES);
                         }
                     }
                     let _ = proxy.send_event(UserEvent::Term(chunk));
