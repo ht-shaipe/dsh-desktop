@@ -126,6 +126,44 @@ pub enum UserEvent {
     UpdateFailed(String),
 }
 
+/// dsh web 页面上的更新进度栏（注入式 DOM，自包含、不依赖 app.js ——
+/// 整页导航后 app.js 的 showUpdateProgress 已被替换，不能再用）。
+/// 固定在页面顶部（原生标题栏正下方）的横条：文本 + 渐变进度条 + 百分比，
+/// 样式与启动页 app.js 的 showUpdateProgress 一致。
+/// `installing` 为 true 时显示"正在安装…"并锁定 100%。
+fn update_bar_show_js(pct: u8, installing: bool) -> String {
+    let fill = if installing { "100".to_string() } else { pct.to_string() };
+    let pct_text = if installing { "100%".to_string() } else { format!("{}%", pct) };
+    let text = if installing { "正在安装更新…" } else { "正在下载更新…" };
+    format!(
+        "(function(){{try{{var b=document.getElementById('dshUpdBar');\
+         if(!b){{b=document.createElement('div');b.id='dshUpdBar';\
+         b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;\
+         background:#1a1f2e;border-bottom:1px solid #2a3242;padding:10px 20px;\
+         display:flex;align-items:center;gap:12px;font:13px -apple-system,BlinkMacSystemFont,sans-serif;\
+         color:#e6e6e6;box-shadow:0 2px 8px rgba(0,0,0,.35);';\
+         b.innerHTML='<span id=\"dshUpdText\"></span>\
+           <div style=\"flex:1;height:6px;background:#2a3242;border-radius:3px;overflow:hidden;\">\
+           <div id=\"dshUpdFill\" style=\"height:100%;width:0%;\
+           background:linear-gradient(90deg,#4f8cff,#7ee0a0);transition:width .2s;\"></div></div>\
+           <span id=\"dshUpdPct\" style=\"min-width:44px;text-align:right;\"></span>';\
+         (document.body||document.documentElement).appendChild(b);}}\
+         document.getElementById('dshUpdText').textContent={text};\
+         document.getElementById('dshUpdFill').style.width='{fill}%';\
+         document.getElementById('dshUpdPct').textContent='{pct_text}';\
+         }}catch(e){{}}}})();",
+        text = ui::js_string_arg(text),
+        fill = fill,
+        pct_text = pct_text,
+    )
+}
+
+/// 移除注入式更新进度栏（幂等：不存在时为空操作）。
+fn update_bar_hide_js() -> String {
+    "(function(){try{var b=document.getElementById('dshUpdBar');if(b)b.remove();}catch(e){}})();"
+        .to_string()
+}
+
 /// 显示一个原生浮动提示窗口，2 秒后自动消失。
 #[cfg(target_os = "macos")]
 fn show_native_toast(text: &str) {
@@ -390,8 +428,10 @@ fn main() {
                 UserEvent::UpdateAvailable(tag, notes) => {
                     if at_dsh_web {
                         // 主页面已是 dsh web 界面：我们注入的 JS（showUpdateDialog）
-                        // 已被整页替换，确认对话框无处显示。改为原生 toast 提示
-                        // + 直接后台下载安装，完成后再次 toast 提示重启。
+                        // 已被整页替换，确认对话框无处显示。改为注入式进度栏
+                        // （标题栏下方）+ 原生 toast 提示 + 直接后台下载安装，
+                        // 完成后再次 toast 提示重启。
+                        let _ = webview.evaluate_script(&update_bar_show_js(0, false));
                         #[cfg(target_os = "macos")]
                         {
                             let t = format!("发现新版本 {}，正在后台下载更新…", tag);
@@ -418,12 +458,16 @@ fn main() {
                     let _ = webview.evaluate_script("setUpdateBtn('检查更新', false)");
                 }
                 UserEvent::UpdateProgress(p) => {
-                    // 注意：JS 函数名是 showUpdateProgress（app.js），
-                    // 且主页面跳到 dsh 界面后该函数不存在，需做存在性判断。
+                    // 启动页：app.js 的 showUpdateProgress 仍然可用；
+                    // dsh web 页面：app.js 已被整页替换，改为注入自绘进度栏
+                    // （固定在原生标题栏正下方，显示实时下载进度）。
                     let _ = webview.evaluate_script(&format!(
                         "if (typeof showUpdateProgress === 'function') showUpdateProgress({});",
                         p
                     ));
+                    if at_dsh_web {
+                        let _ = webview.evaluate_script(&update_bar_show_js(p, p >= 100));
+                    }
                 }
                 UserEvent::UpdateDone(tag) => {
                     if tag.is_empty() {
@@ -432,7 +476,8 @@ fn main() {
                         #[cfg(not(target_os = "macos"))]
                         let _ = webview.evaluate_script("showUpdateToast('已是最新版本')");
                     } else if at_dsh_web {
-                        // dsh 界面：没有完成对话框可显示，用原生 toast 提示重启。
+                        // dsh 界面：先收起注入式进度栏，再用原生 toast 提示重启。
+                        let _ = webview.evaluate_script(&update_bar_hide_js());
                         #[cfg(target_os = "macos")]
                         {
                             let t = format!("已升级到 {}，重启应用后生效", tag);
@@ -453,7 +498,8 @@ fn main() {
                     }
                 }
                 UserEvent::UpdateFailed(msg) => {
-                    // 失败提示：优先原生 toast；启动页同时收起进度条。
+                    // 失败提示：优先原生 toast；同时收起两个视图的进度条
+                    // （启动页的 app.js 进度条 / dsh 页面的注入式进度栏）。
                     #[cfg(target_os = "macos")]
                     { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| show_native_toast(&msg))); }
                     #[cfg(not(target_os = "macos"))]
@@ -464,6 +510,7 @@ fn main() {
                     let _ = webview.evaluate_script(
                         "if (typeof hideUpdateProgress === 'function') hideUpdateProgress();",
                     );
+                    let _ = webview.evaluate_script(&update_bar_hide_js());
                 }
                 UserEvent::ShowHelp => {
                     if let Some((hw, _)) = &help_window {
@@ -719,5 +766,38 @@ fn setup_titlebar_accessory(webview: &wry::WebView, proxy: &tao::event_loop::Eve
             &*ns_window as *const _ as *mut AnyObject,
             addTitlebarAccessoryViewController: vc
         ];
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_bar_js_is_well_formed() {
+        let js = update_bar_show_js(42, false);
+        assert!(js.starts_with("(function()"));
+        assert!(js.ends_with("})();"));
+        assert!(js.contains("dshUpdBar"));
+        assert!(js.contains("dshUpdFill"));
+        assert!(js.contains("textContent=\"正在下载更新…\""));
+        assert!(js.contains("width='42%'"));
+        assert!(js.contains("'42%'"));
+
+        let js = update_bar_show_js(100, true);
+        assert!(js.contains("textContent=\"正在安装更新…\""));
+        assert!(js.contains("width='100%'"));
+
+        let js = update_bar_hide_js();
+        assert!(js.contains("dshUpdBar"));
+        assert!(js.contains(".remove()"));
+    }
+
+    #[test]
+    fn update_bar_js_printable() {
+        // 人工核对 / 语法检查用：
+        // cargo test update_bar_js_printable -- --nocapture
+        println!("SHOW42={}", update_bar_show_js(42, false));
+        println!("SHOW100={}", update_bar_show_js(100, true));
+        println!("HIDE={}", update_bar_hide_js());
     }
 }
