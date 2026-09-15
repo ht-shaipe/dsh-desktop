@@ -25,7 +25,8 @@ GIT_BRANCH     := $(shell git branch --show-current)
 REPO_URL       := https://github.com/ht-shaipe/dsh-desktop
 
 # 计算下一版本（自动 bump patch，跳过已存在的标签）
-NEXT_PATCH := $(shell v=$(shell echo $(CURRENT_VERSION) | awk -F. '{print $$1"."$$2"."$$3+1}'); while git tag -l "v$$v" | grep -q .; do v=$(echo $$v | awk -F. '{print $$1"."$$2"."$$3+1}'); done; echo $$v)
+# 注意：循环体里的命令替换必须写成 $$(...)，否则会被 make 当作变量引用展开为空
+NEXT_PATCH := $(shell v=$(CURRENT_VERSION); while git tag -l "v$$v" | grep -q .; do v=$$(echo $$v | awk -F. '{print $$1"."$$2"."$$3+1}'); done; echo $$v)
 
 # 如果指定了 VERSION 则使用指定版本，否则自动 bump
 RELEASE_VERSION := $(if $(VERSION),$(VERSION),$(NEXT_PATCH))
@@ -113,6 +114,7 @@ sign:
 # 流程: 校验 → (可选)构建检查 → 提交未提交改动 → 同步版本号 → 更新 Cargo.lock → 提交 → 标签 → 推送
 
 release:
+	@test -n "$(RELEASE_VERSION)" || (echo "$(C_RED)错误: 未能确定目标版本号。用法: make release VERSION=0.1.19$(C_RESET)" && exit 1)
 	@test "$(RELEASE_VERSION)" != "$(CURRENT_VERSION)" || (echo "$(C_RED)错误: 版本号未变更（当前已是 $(CURRENT_VERSION)）$(C_RESET)" && exit 1)
 	@! git tag -l "v$(RELEASE_VERSION)" | grep -q . || (echo "$(C_RED)错误: 标签 v$(RELEASE_VERSION) 已存在$(C_RESET)" && exit 1)
 	@echo "$(C_BOLD)═══ 发布 v$(RELEASE_VERSION) ═══$(C_RESET)"
