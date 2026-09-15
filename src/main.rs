@@ -369,6 +369,14 @@ fn main() {
                 setup_macos_app_menu();
             }
         }
+        // macOS: 注册 Dock 图标点击处理器（关闭窗口后点 Dock 图标恢复显示）
+        #[cfg(target_os = "macos")]
+        {
+            static DOCK_HANDLER: AtomicBool = AtomicBool::new(false);
+            if !DOCK_HANDLER.swap(true, Ordering::SeqCst) {
+                setup_dock_reopen_handler(&window);
+            }
+        }
 
         match event {
             // 后台线程发来的自定义事件：转换为对 webview 的 JS 调用，驱动 UI 更新。
@@ -580,8 +588,8 @@ fn main() {
             Event::WindowEvent { window_id, event, .. } => match event {
                 WindowEvent::CloseRequested => {
                     if window_id == main_window_id {
-                        // 关闭主窗口：退出整个应用（事件循环销毁时会杀掉服务进程）
-                        *control_flow = ControlFlow::Exit;
+                        // 关闭主窗口：只隐藏，不退出（macOS 标准行为：留在 Dock）
+                        window.set_visible(false);
                     } else if help_window
                         .as_ref()
                         .map(|(hw, _)| hw.id() == window_id)
@@ -589,6 +597,14 @@ fn main() {
                     {
                         // 关闭帮助窗口：只销毁它，应用继续运行
                         help_window = None;
+                    }
+                }
+                // macOS: 点击 Dock 图标时，如果主窗口被隐藏了就重新显示
+                #[cfg(target_os = "macos")]
+                WindowEvent::Focused(true) if window_id == main_window_id => {
+                    if !window.is_visible() {
+                        window.set_visible(true);
+                        window.set_focus();
                     }
                 }
                 _ => {}
@@ -602,6 +618,52 @@ fn main() {
             _ => {}
         }
     });
+}
+
+/// macOS: 注册 Dock 图标点击处理器。
+/// 点击 Dock 图标时，如果主窗口被隐藏了就重新显示。
+#[cfg(target_os = "macos")]
+fn setup_dock_reopen_handler(window: &tao::window::Window) {
+    use std::ffi::CStr;
+    use std::sync::atomic::AtomicPtr;
+    use objc2::runtime::{AnyObject, ClassBuilder, Bool};
+    use objc2::{class, sel};
+
+    // 把窗口指针存到静态变量里（window 由事件循环闭包持有，存活于整个应用生命周期）
+    static WINDOW_PTR: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+    let raw = window as *const tao::window::Window as *mut std::ffi::c_void;
+    WINDOW_PTR.store(raw, Ordering::SeqCst);
+
+    unsafe {
+        let superclass = class!(NSResponder);
+        let mut builder = ClassBuilder::new(CStr::from_bytes_with_nul_unchecked(b"DSHDockReopen\0"), superclass).unwrap();
+
+        // applicationShouldHandleReopen:hasVisibleWindows:
+        extern "C-unwind" fn handle_reopen(_self: &mut AnyObject, _sel: objc2::runtime::Sel, _app: *mut AnyObject, _has_visible: Bool) -> Bool {
+            unsafe {
+                let ptr = WINDOW_PTR.load(Ordering::SeqCst);
+                if !ptr.is_null() {
+                    let w = &*(ptr as *const tao::window::Window);
+                    w.set_visible(true);
+                    w.set_focus();
+                }
+            }
+            Bool::YES
+        }
+
+        builder.add_method(
+            sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+            handle_reopen as extern "C-unwind" fn(_, _, _, _) -> _,
+        );
+
+        let cls = builder.register();
+        let delegate: *mut AnyObject = objc2::msg_send![cls, alloc];
+        let delegate: *mut AnyObject = objc2::msg_send![delegate, init];
+
+        let app_cls = class!(NSApplication);
+        let app: *mut AnyObject = objc2::msg_send![app_cls, sharedApplication];
+        let _: () = objc2::msg_send![app, setDelegate: delegate];
+    }
 }
 
 /// 构建一个最小化的 macOS "编辑"菜单（撤销、重做、剪切、复制、粘贴、
