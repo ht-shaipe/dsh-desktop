@@ -19,6 +19,8 @@
   - 若本机没有 `npx`，终端会打印 `✗ … 正在自动下载并安装便携版…`，并**以一行实时刷新的下载进度**（如 `下载进度  45%`）从国内 npmmirror 镜像拉取便携版 Node.js 到本地缓存目录并解压（无需管理员权限，且只下载一次）。
 - **可视化进度**：启动全过程（环境检查 → 必要时的 Node 下载/解压 → 服务启动 → 端口就绪）都像真实终端一样逐行/逐字实时呈现，不再是空白等待；顶部状态栏也会同步显示当前阶段。
 - **启动失败可诊断**：若命令启动后长时间（最长 10 分钟）未监听 `127.0.0.1:3080`，窗口会**保留交互终端**并在底部弹出红色横幅，横幅内附上命令最近的输出日志，便于定位真正缺什么（如缺少 git / Docker 等 dsh 的依赖）。
+- **启动失败自动恢复**：dsh 的插件跑在同一个 node 进程里，任何一个插件在启动阶段崩溃都会拖垮整个服务。若第 1 次启动失败，壳层会从终端输出中提取故障插件，通过 dsh profile 补丁（`~/.dsh/profiles/web/cordis.patch.yml`）将其 `disabled` 后自动重试（最多 2 轮）；仍无法定位时降级为**安全模式**（一次性停用所有第三方插件）再试；最终仍失败才放弃并给出完整诊断报告。自动写入的补丁条目带 `dsh-desktop auto-recovery` 标记，删除即可恢复插件。
+- **原生菜单快捷键（macOS）**：自动创建原生菜单栏——应用菜单（⌘Q 退出）与编辑菜单（⌘C/⌘V/⌘A/⌘Z/⌘X），快捷键由 AppKit 正确路由到 webview 输入框。
 - **干净退出**：关闭窗口时用 `killpg` 杀掉整个进程组（含 npx 拉起的 node 子进程）。
 - **应用自动升级**：启动时自动检查 GitHub Releases 是否有新版 dsh-desktop；若有，会在内置终端里显示「发现新版本」并**自动下载对应平台的安装包并就地升级**（macOS 挂载 dmg 替换 .app，Linux 解压 tar.gz 覆盖可执行文件，Windows 退出后由脚本替换 exe）。升级过程逐行打印在终端里；无网络或检查失败时静默跳过，不影响正常启动。升级完成后提示「重启应用生效」。
 - **原生图标**：内嵌窗口图标（Windows/Linux）与 macOS `.app` 的 Dock 图标（`icon/` 目录的 logo）。
@@ -50,7 +52,7 @@
 
 ## 环境要求
 
-- **macOS / Linux / Windows**（Rust 跨平台；当前打包脚本仅提供 macOS 版本）
+- **macOS / Linux / Windows**（Rust 跨平台；本地打包脚本仅覆盖 macOS，全平台安装包由 CI 自动构建并发布到 [GitHub Releases](https://github.com/ht-shaipe/dsh-desktop/releases)）
 - 编译/运行需要 **Rust 工具链**（见下文）与 **Node.js**（本机没有的话，程序会尝试自动下载便携版）
 
 > 注意：`dsh web` 这条命令本身可能还需要 git、Docker 等依赖（取决于 dsh 的实现）。若窗口提示启动超时，请把窗口中的红色报错日志发出来，以便判断还缺什么。
@@ -96,6 +98,37 @@ cargo run --release
 
 产物为 `dsh-desktop.dmg`。该脚本会先调用 `package-macos.sh` 确保 `.app` 最新，再生成带「拖到 Applications」安装体验的磁盘映像。
 
+### 4. 下载预编译安装包（推荐普通用户）
+
+无需本地构建，直接到 [Releases](https://github.com/ht-shaipe/dsh-desktop/releases) 下载对应平台安装包（由 `.github/workflows/release.yml` 在推送 `v*` 标签或手动触发时自动构建）：
+
+| 平台 | 产物 |
+| --- | --- |
+| macOS (Apple Silicon) | `dsh-desktop-macos-aarch64.dmg` |
+| macOS (Intel) | `dsh-desktop-macos-x86_64.dmg` |
+| Linux (x86_64) | `dsh-desktop-linux-x86_64.tar.gz` |
+| Windows (x86_64) | `dsh-desktop-windows-x86_64.zip` |
+
+每个安装包均附带 minisign 签名（`.sig`，供客户端自动更新时校验）与 `checksums.txt`（SHA-256）。
+
+---
+
+## 更新签名密钥（维护者）
+
+自动升级依赖 minisign (Ed25519) 签名，密钥相关操作：
+
+```bash
+# 1) 首次生成密钥对（私钥 ~/.dsh-desktop-updater.key，公钥 .key.pub）
+./scripts/generate-updater-key.sh
+#    - 公钥内容填入 src/updater.rs 的 UPDATER_PUBKEY 常量
+#    - 私钥内容配置为 GitHub Secret: DSH_UPDATER_PRIVATE_KEY（CI 发版时自动签名）
+#    - 私钥若有密码，另配 Secret: DSH_UPDATER_PRIVATE_KEY_PASSWORD
+
+# 2) 本地手动签名安装包（生成同名 .sig 文件）
+DSH_UPDATER_PRIVATE_KEY="$(cat ~/.dsh-desktop-updater.key)" \
+  ./scripts/sign-update.sh dsh-desktop-macos-aarch64.dmg
+```
+
 ---
 
 ## 自动安装 Node.js 的细节
@@ -125,20 +158,28 @@ DSH_NPX=/usr/local/bin/npx ./target/release/dsh-desktop
 
 ```
 dsh-desktop/
-├── Cargo.toml            # 依赖：tao(窗口) + wry(WebKit webview) + libc + png
+├── Cargo.toml                # 依赖：tao(窗口) + wry(WebKit webview) + reqwest(更新下载)
+│                             #       + minisign-verify(签名校验) + objc2(macOS 原生菜单)
 ├── src/
-│   ├── main.rs          # 入口：窗口/webview 创建、事件循环、UserEvent 分发
-│   ├── environment.rs   # 环境自检 + 便携 Node.js 自动下载/解压
-│   ├── terminal.rs      # PTY/管道启动命令、确认提示检测、端口轮询
-│   ├── ui.rs            # webview 的 HTML/JS 资源加载 + 字符串辅助
-│   └── (resources 见下)
-├── resources/
-│   ├── index.html       # webview 的 HTML 结构 + CSS（含 JS 占位符）
-│   └── app.js           # webview 的 JavaScript（终端渲染、IPC、进度）
-├── icon/                # 图标源文件（logo-48/96/240/480.png）+ 生成的 AppIcon.icns
-├── package-macos.sh     # 打包 macOS .app（含生成 icns、刷新图标缓存）
-├── package-dmg.sh       # 打包可分发 .dmg
-├── .gitignore           # 忽略 target/、*.app/、*.dmg、生成的 icns 等
+│   ├── main.rs              # 入口：窗口/webview 创建、事件循环、macOS 原生菜单
+│   ├── environment.rs       # 环境自检 + 便携 Node.js 自动下载/解压
+│   ├── terminal.rs          # PTY/管道启动命令、确认提示检测、端口轮询
+│   ├── recovery.rs          # 启动失败自动恢复（故障插件禁用 + 安全模式降级）
+│   ├── updater.rs           # 自动更新：版本检查、minisign 签名校验、下载与就地升级
+│   └── ui.rs                # webview 的 HTML/JS 资源加载 + 字符串辅助
+├── resources/               # 编译期嵌入 webview 的静态资源
+│   ├── index.html           # HTML 结构 + CSS（含 JS 占位符）
+│   ├── app.js               # JavaScript（终端渲染、IPC、进度）
+│   └── dsh-desktop.desktop  # Linux 桌面入口文件
+├── scripts/
+│   ├── generate-updater-key.sh  # 生成 minisign 更新签名密钥对
+│   └── sign-update.sh           # 本地手动签名更新包
+├── .github/workflows/release.yml  # 跨平台自动发版（tag / 手动触发，构建+签名+Release）
+├── docs/                    # 发布文章与官网落地页
+├── icon/                    # 图标源文件（logo PNG）+ 生成的 AppIcon.icns
+├── package-macos.sh         # 打包 macOS .app（含生成 icns、刷新图标缓存）
+├── package-dmg.sh           # 打包可分发 .dmg
+├── 使用说明.txt              # 随 DMG 分发的最终用户说明
 └── README.md
 ```
 
