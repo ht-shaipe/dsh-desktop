@@ -717,6 +717,17 @@ fn setup_macos_app_menu() {
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add(&edit_menu, "Select All", Some(objc2::sel!(selectAll:)), "a");
 
+    // 应用菜单：提供 ⌘Q 退出。action 的 target 为 nil（first responder），
+    // terminate: 沿响应链最终由 NSApp 处理，无需自己实现。
+    // 它必须是主菜单的第一项，AppKit 才会把它渲染为粗体的应用菜单。
+    let app_menu = NSMenu::new(mtm);
+    app_menu.setTitle(&NSString::from_str("App"));
+    let app_item = NSMenuItem::new(mtm);
+    app_item.setTitle(&NSString::from_str("dsh-desktop"));
+    app_item.setSubmenu(Some(&app_menu));
+    add(&app_menu, "Quit dsh-desktop", Some(objc2::sel!(terminate:)), "q");
+
+    main_menu.addItem(&app_item);
     main_menu.addItem(&edit_item);
     app.setMainMenu(Some(&main_menu));
 }

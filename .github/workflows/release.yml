@@ -88,11 +88,15 @@ jobs:
             bash package-dmg.sh
 
       - name: Sign update packages
-        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
+        # secrets 上下文不允许出现在 if 表达式中（GitHub 解析器限制），
+        # 改为脚本内判断：未配置私钥时输出提示并跳过签名
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
         run: |
-          # Create temporary key file
+          if [ -z "$DSH_UPDATER_PRIVATE_KEY" ]; then
+            echo "DSH_UPDATER_PRIVATE_KEY is not set, skip signing"
+            exit 0
+          fi
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
@@ -155,10 +159,13 @@ jobs:
           tar -czvf dsh-desktop-linux-x86_64.tar.gz -C dist .
 
       - name: Sign update package
-        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
         run: |
+          if [ -z "$DSH_UPDATER_PRIVATE_KEY" ]; then
+            echo "DSH_UPDATER_PRIVATE_KEY is not set, skip signing"
+            exit 0
+          fi
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
@@ -202,11 +209,14 @@ jobs:
           Compress-Archive -Path target/release/dsh-desktop.exe -DestinationPath dsh-desktop-windows-x86_64.zip
 
       - name: Sign update package
-        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
         shell: bash
         run: |
+          if [ -z "$DSH_UPDATER_PRIVATE_KEY" ]; then
+            echo "DSH_UPDATER_PRIVATE_KEY is not set, skip signing"
+            exit 0
+          fi
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
