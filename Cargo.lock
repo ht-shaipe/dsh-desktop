@@ -438,7 +438,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dsh-desktop"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "base64",
  "futures-util",
