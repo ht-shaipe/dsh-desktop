@@ -88,20 +88,20 @@ jobs:
             bash package-dmg.sh
 
       - name: Sign update packages
-        if: env.DSH_UPDATER_PRIVATE_KEY != ''
+        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
-          DSH_UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.DSH_UPDATER_PRIVATE_KEY_PASSWORD }}
         run: |
           # Create temporary key file
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
-          # Sign both DMGs
-          rsign sign -s "$TEMP_KEY" -P "${DSH_UPDATER_PRIVATE_KEY_PASSWORD:-}" \
-            dsh-desktop-macos-aarch64.dmg || true
-          rsign sign -s "$TEMP_KEY" -P "${DSH_UPDATER_PRIVATE_KEY_PASSWORD:-}" \
-            dsh-desktop-macos-x86_64.dmg || true
+          # Sign both DMGs (rsign2: -W = passwordless secret key;
+          # 签名产物为 .minisig，上传时重命名为 <asset>.sig)
+          rsign sign dsh-desktop-macos-aarch64.dmg -s "$TEMP_KEY" -W \
+            -x dsh-desktop-macos-aarch64.dmg.sig -t "dsh-desktop update package"
+          rsign sign dsh-desktop-macos-x86_64.dmg -s "$TEMP_KEY" -W \
+            -x dsh-desktop-macos-x86_64.dmg.sig -t "dsh-desktop update package"
           
           rm -f "$TEMP_KEY"
 
@@ -155,16 +155,15 @@ jobs:
           tar -czvf dsh-desktop-linux-x86_64.tar.gz -C dist .
 
       - name: Sign update package
-        if: env.DSH_UPDATER_PRIVATE_KEY != ''
+        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
-          DSH_UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.DSH_UPDATER_PRIVATE_KEY_PASSWORD }}
         run: |
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
-          rsign sign -s "$TEMP_KEY" -P "${DSH_UPDATER_PRIVATE_KEY_PASSWORD:-}" \
-            dsh-desktop-linux-x86_64.tar.gz || true
+          rsign sign dsh-desktop-linux-x86_64.tar.gz -s "$TEMP_KEY" -W \
+            -x dsh-desktop-linux-x86_64.tar.gz.sig -t "dsh-desktop update package"
           
           rm -f "$TEMP_KEY"
 
@@ -203,17 +202,16 @@ jobs:
           Compress-Archive -Path target/release/dsh-desktop.exe -DestinationPath dsh-desktop-windows-x86_64.zip
 
       - name: Sign update package
-        if: env.DSH_UPDATER_PRIVATE_KEY != ''
+        if: ${{ secrets.DSH_UPDATER_PRIVATE_KEY != '' }}
         env:
           DSH_UPDATER_PRIVATE_KEY: ${{ secrets.DSH_UPDATER_PRIVATE_KEY }}
-          DSH_UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.DSH_UPDATER_PRIVATE_KEY_PASSWORD }}
         shell: bash
         run: |
           TEMP_KEY=$(mktemp)
           echo "$DSH_UPDATER_PRIVATE_KEY" > "$TEMP_KEY"
           
-          rsign sign -s "$TEMP_KEY" -P "${DSH_UPDATER_PRIVATE_KEY_PASSWORD:-}" \
-            dsh-desktop-windows-x86_64.zip || true
+          rsign sign dsh-desktop-windows-x86_64.zip -s "$TEMP_KEY" -W \
+            -x dsh-desktop-windows-x86_64.zip.sig -t "dsh-desktop update package"
           
           rm -f "$TEMP_KEY"
 

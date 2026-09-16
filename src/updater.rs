@@ -43,7 +43,7 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// CI/CD 配置：
 ///   - 私钥存入 GitHub Secret: DSH_UPDATER_PRIVATE_KEY
 ///   - 私钥密码存入: DSH_UPDATER_PRIVATE_KEY_PASSWORD
-const UPDATER_PUBKEY: &str = "PLACEHOLDER_REPLACE_WITH_ACTUAL_PUBLIC_KEY";
+const UPDATER_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk1OEM3NDNBNjI2NkExNTkKUldSWm9XWmlPblNNbGFuL1hBY0k3bm1Gc0pGY005c1hOaVdNdXJIdHpwOHB6K3FCMzB1TWtkQUQK";
 
 /// 我们关心的最新 Release 元数据。
 pub struct Release {
@@ -95,23 +95,13 @@ fn verify_signature(file_path: &Path, signature_content: &str) -> Result<(), Str
     let file_content = fs::read(file_path)
         .map_err(|e| format!("无法读取文件进行签名验证: {}", e))?;
 
-    // 解码公钥（base64 -> minisign 格式）
-    let pubkey_decoded = STANDARD.decode(UPDATER_PUBKEY.as_bytes())
-        .map_err(|e| format!("无法解码公钥: {}", e))?;
-    let pubkey_str = String::from_utf8(pubkey_decoded)
-        .map_err(|e| format!("公钥格式无效: {}", e))?;
-
-    // 用 decode 方法解析公钥（可解析 minisign 格式）
+    // 公钥/签名兼容两种格式：minisign 原生格式（untrusted comment 行 + base64 行）
+    // 或整体 base64 编码后的文本。
+    let pubkey_str = decode_minisign_or_base64(UPDATER_PUBKEY)?;
     let public_key = PublicKey::decode(&pubkey_str)
         .map_err(|e| format!("无法解析公钥: {}", e))?;
 
-    // 解码签名（base64 -> minisign 格式）
-    let sig_decoded = STANDARD.decode(signature_content.as_bytes())
-        .map_err(|e| format!("无法解码签名: {}", e))?;
-    let sig_str = String::from_utf8(sig_decoded)
-        .map_err(|e| format!("签名格式无效: {}", e))?;
-
-    // 用 decode 方法解析签名（可解析 minisign 格式）
+    let sig_str = decode_minisign_or_base64(signature_content)?;
     let signature = Signature::decode(&sig_str)
         .map_err(|e| format!("无法解析签名: {}", e))?;
 
@@ -120,6 +110,18 @@ fn verify_signature(file_path: &Path, signature_content: &str) -> Result<(), Str
         .map_err(|e| format!("签名验证失败: {}", e))?;
 
     Ok(())
+}
+
+/// 把 minisign 原生格式文本原样返回；否则视为整体 base64 编码解码后返回。
+fn decode_minisign_or_base64(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    if s.starts_with("untrusted comment:") {
+        Ok(s.to_string())
+    } else {
+        let decoded = STANDARD.decode(s.as_bytes())
+            .map_err(|e| format!("base64 解码失败: {}", e))?;
+        String::from_utf8(decoded).map_err(|e| format!("解码后非 UTF-8 文本: {}", e))
+    }
 }
 
 /// 通过 reqwest 请求 `https://api.github.com/repos/<repo>/releases/latest`
